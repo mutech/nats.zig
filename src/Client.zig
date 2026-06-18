@@ -563,6 +563,9 @@ pub const ParsedUrl = struct {
     user: ?[]const u8,
     pass: ?[]const u8,
     use_tls: bool,
+    /// Whether this URL uses the nats+uds:// scheme. When true, `host`
+    /// holds the UNIX domain socket path and `port` is unused.
+    is_uds: bool = false,
 };
 
 /// Fixed subscription limits (from defaults.zig).
@@ -581,10 +584,14 @@ pub fn parseUrl(url: []const u8) error{InvalidUrl}!ParsedUrl {
     if (url.len == 0) return error.InvalidUrl;
     var remaining = url;
     var use_tls = false;
+    var is_uds = false;
 
     if (std.mem.startsWith(u8, remaining, "tls://")) {
         remaining = remaining[6..];
         use_tls = true;
+    } else if (std.mem.startsWith(u8, remaining, "nats+uds://")) {
+        remaining = remaining["nats+uds://".len..];
+        is_uds = true;
     } else if (std.mem.startsWith(u8, remaining, "nats://")) {
         remaining = remaining[7..];
     }
@@ -605,6 +612,19 @@ pub fn parseUrl(url: []const u8) error{InvalidUrl}!ParsedUrl {
     }
 
     if (remaining.len == 0) return error.InvalidUrl;
+
+    // For nats+uds the remainder is the socket path verbatim; there is no
+    // host/port to split out.
+    if (is_uds) {
+        return .{
+            .host = remaining,
+            .port = 0,
+            .user = user,
+            .pass = pass,
+            .use_tls = use_tls,
+            .is_uds = true,
+        };
+    }
 
     var host: []const u8 = undefined;
     var port: u16 = 4222;
@@ -670,6 +690,14 @@ fn connectToHost(io: Io, host: []const u8, port: u16) !net.Stream {
         .mode = .stream,
         .protocol = .tcp,
     }) catch return error.ConnectionFailed;
+}
+
+/// Connect to a NATS server over a UNIX domain socket at `path`.
+/// Returns the same net.Stream as the TCP path, so everything
+/// downstream (reader/writer, handshake, TLS upgrade) is unchanged.
+fn connectToUds(io: Io, path: []const u8) !net.Stream {
+    const addr = net.UnixAddress.init(path) catch return error.InvalidAddress;
+    return addr.connect(io) catch return error.ConnectionFailed;
 }
 
 /// Subscription type alias.
@@ -962,7 +990,10 @@ pub fn connect(
         allocator.destroy(client);
     }
 
-    client.stream = try connectToHost(io, parsed.host, parsed.port);
+    client.stream = if (parsed.is_uds)
+        try connectToUds(io, parsed.host)
+    else
+        try connectToHost(io, parsed.host, parsed.port);
     client.stream_open = true;
     errdefer client.closeIfOpen();
 
@@ -4099,7 +4130,10 @@ pub fn tryConnect(
 
     // Connect, then atomically install the new stream so deinit/drain
     // see a consistent (handle, stream_open) pair.
-    const new_stream = try connectToHost(self.io, raw_host, port);
+    const new_stream = if (server.is_uds)
+        try connectToUds(self.io, raw_host)
+    else
+        try connectToHost(self.io, raw_host, port);
     {
         self.stream_mutex.lockUncancelable(self.io);
         defer self.stream_mutex.unlock(self.io);
@@ -4134,6 +4168,7 @@ pub fn tryConnect(
         .user = null,
         .pass = null,
         .use_tls = self.use_tls,
+        .is_uds = server.is_uds,
     };
 
     self.use_tls = self.use_tls or parsed.use_tls or
@@ -5097,6 +5132,43 @@ test "parse url default port" {
     const parsed = try parseUrl("nats://myserver");
     try std.testing.expectEqualSlices(u8, "myserver", parsed.host);
     try std.testing.expectEqual(@as(u16, 4222), parsed.port);
+}
+
+test "parse url nats+uds scheme" {
+    // Absolute socket path: host carries the path verbatim, no port.
+    {
+        const parsed = try parseUrl("nats+uds:///run/snats/snats.sock");
+        try std.testing.expect(parsed.is_uds);
+        try std.testing.expectEqualSlices(u8, "/run/snats/snats.sock", parsed.host);
+        try std.testing.expect(!parsed.use_tls);
+        try std.testing.expect(parsed.user == null);
+        try std.testing.expect(parsed.pass == null);
+    }
+
+    // user:pass before the path are still parsed; path is the remainder.
+    {
+        const parsed = try parseUrl("nats+uds://user:pass@/tmp/snats.sock");
+        try std.testing.expect(parsed.is_uds);
+        try std.testing.expectEqualSlices(u8, "/tmp/snats.sock", parsed.host);
+        try std.testing.expectEqualSlices(u8, "user", parsed.user.?);
+        try std.testing.expectEqualSlices(u8, "pass", parsed.pass.?);
+    }
+
+    // A path containing a colon is taken verbatim, not split into host:port.
+    {
+        const parsed = try parseUrl("nats+uds:///tmp/dir:weird/snats.sock");
+        try std.testing.expect(parsed.is_uds);
+        try std.testing.expectEqualSlices(u8, "/tmp/dir:weird/snats.sock", parsed.host);
+    }
+
+    // Non-uds schemes leave is_uds false.
+    {
+        const parsed = try parseUrl("nats://localhost:4222");
+        try std.testing.expect(!parsed.is_uds);
+    }
+
+    // Missing path is rejected.
+    try std.testing.expectError(error.InvalidUrl, parseUrl("nats+uds://"));
 }
 
 test "options defaults" {

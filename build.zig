@@ -756,4 +756,31 @@ pub fn build(b: *std.Build) void {
         tls_integration_exe,
     );
     run_tls_integration.dependOn(&tls_integration_cmd.step);
+
+    // UNIX domain socket integration tests (nats+uds:// scheme).
+    // Requires a nats-server build with UDS support on PATH.
+    const uds_integration_exe = b.addExecutable(.{
+        .name = "uds-integration-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(
+                "src/testing/uds_integration_test.zig",
+            ),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "nats", .module = nats },
+                .{ .name = "io_backend", .module = io_backend_mod },
+            },
+        }),
+    });
+    b.installArtifact(uds_integration_exe);
+
+    const run_uds_integration = b.step(
+        "test-integration-uds",
+        "Run only the UNIX domain socket integration tests",
+    );
+    const uds_integration_cmd = b.addRunArtifact(
+        uds_integration_exe,
+    );
+    run_uds_integration.dependOn(&uds_integration_cmd.step);
 }
