@@ -117,10 +117,21 @@ jobs:
           nats-server --version
           nats --version
 
-      - name: Run integration tests
-        run: |
-          set -euo pipefail
-          zig build test-integration ${{ matrix.args }}
-          zig build test-integration-micro ${{ matrix.args }}
-          zig build test-integration-tls ${{ matrix.args }}
-          zig build test-integration-uds ${{ matrix.args }}
+      # Each suite is its own step so all of them run and surface their own
+      # pass/fail. UDS runs first for fast feedback; `!cancelled()` lets later
+      # suites run even if an earlier one failed, instead of one failure hiding
+      # the rest.
+      - name: Run integration tests (UDS)
+        run: zig build test-integration-uds ${{ matrix.args }}
+
+      - name: Run integration tests (core)
+        if: ${{ !cancelled() }}
+        run: zig build test-integration ${{ matrix.args }}
+
+      - name: Run integration tests (micro)
+        if: ${{ !cancelled() }}
+        run: zig build test-integration-micro ${{ matrix.args }}
+
+      - name: Run integration tests (TLS)
+        if: ${{ !cancelled() }}
+        run: zig build test-integration-tls ${{ matrix.args }}
