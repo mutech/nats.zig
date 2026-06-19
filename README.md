@@ -12,6 +12,8 @@
 
 # nats.zig
 
+(This fork adds support for UNIX domain sockets as a proof of concept. Rough patch, will be polished later).
+
 A [Zig](https://ziglang.org/) client for the [NATS messaging system](https://nats.io).
 
 The public API is `std.Io`-idiomatic — `io.async`/futures, `Io.Select`,
