@@ -977,8 +977,15 @@ pub fn connect(
         client.tls_host_len = host_len;
     }
 
-    // Initialize slab allocator (critical for O(1) message allocation)
-    client.tiered_slab = TieredSlab.init(allocator) catch |err| {
+    // Initialize slab allocator (critical for O(1) message allocation).
+    // Sized at runtime from the sub_queue_size option: the default option
+    // value equals defaults.Memory.queue_size, so a client that does not set
+    // it gets the exact comptime-default slab, while a low-rate client (small
+    // sub_queue_size) preallocates a proportionally tiny slab.
+    client.tiered_slab = TieredSlab.initWithCounts(
+        allocator,
+        defaults.Memory.tierCountsFor(opts.sub_queue_size),
+    ) catch |err| {
         allocator.destroy(client);
         return err;
     };

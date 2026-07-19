@@ -163,8 +163,21 @@ pub const TieredSlab = struct {
     fallback: Allocator,
     fallback_count: u32,
 
-    /// Initialize all tiers with mmap'd memory.
+    /// Initialize all tiers with mmap'd memory using the comptime default
+    /// tier counts (derived from defaults.Memory.queue_size).
     pub fn init(fallback_allocator: Allocator) !TieredSlab {
+        return initWithCounts(fallback_allocator, Config.tier_counts);
+    }
+
+    /// Initialize all tiers with runtime-supplied slice counts (one per
+    /// tier). Tier slice SIZES stay fixed (comptime); only the per-tier COUNT
+    /// is runtime, so a low-rate client can preallocate a tiny slab while a
+    /// high-throughput client preallocates a large one. Backing memory is
+    /// page-allocated per tier by Slab.init, exactly as the default path.
+    pub fn initWithCounts(
+        fallback_allocator: Allocator,
+        tier_counts: [Config.TIER_COUNT]u32,
+    ) !TieredSlab {
         var ts: TieredSlab = undefined;
         ts.fallback = fallback_allocator;
         ts.fallback_count = 0;
@@ -176,7 +189,7 @@ pub const TieredSlab = struct {
             }
         }
 
-        for (Config.tier_sizes, Config.tier_counts, 0..) |size, count, i| {
+        for (Config.tier_sizes, tier_counts, 0..) |size, count, i| {
             ts.tiers[i] = try Slab.init(size, count);
             initialized += 1;
         }
@@ -395,6 +408,39 @@ test "TieredSlab tier selection" {
 
     const stats = ts.getStats();
     try std.testing.expectEqual(@as(u32, 0), stats.totalAllocated());
+}
+
+test "TieredSlab runtime sizing: tiny queue size -> tiny slab" {
+    const fallback = std.testing.allocator;
+
+    // A tiny queue size (like a low-rate isp-acs client) must yield a slab
+    // whose per-tier capacities match the derived counts and whose total
+    // preallocation is a small fraction of the comptime default.
+    const tiny_q: u32 = 128;
+    const counts = defaults.Memory.tierCountsFor(tiny_q);
+    try std.testing.expectEqualSlices(
+        u32,
+        &[_]u32{ 128, 128, 64, 32, 8 },
+        &counts,
+    );
+
+    var ts = try TieredSlab.initWithCounts(fallback, counts);
+    defer ts.deinit();
+
+    const stats = ts.getStats();
+    try std.testing.expectEqual(@as(u32, 0), stats.totalAllocated());
+    // Sum of per-tier capacities equals the sum of the derived counts.
+    var expected_cap: u32 = 0;
+    for (counts) |c| expected_cap += c;
+    try std.testing.expectEqual(expected_cap, stats.totalCapacity());
+
+    // Total preallocated bytes for tiny_q must be far below the comptime
+    // default (which is sized by defaults.Memory.queue_size = 8192).
+    var tiny_bytes: usize = 0;
+    for (Config.tier_sizes, counts) |size, count| {
+        tiny_bytes += @as(usize, size) * count;
+    }
+    try std.testing.expect(tiny_bytes * 16 < Config.total_memory);
 }
 
 test "SlabAllocator interface" {

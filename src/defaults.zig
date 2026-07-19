@@ -34,16 +34,24 @@ pub const Memory = struct {
     pub const tier_count: usize = tier_sizes.len;
 
     /// Slab tier counts (derived from queue_size).
-    pub const tier_counts = blk: {
-        const q = queue_size.value();
-        break :blk [_]u32{
-            q, // Tier 0: 256B
-            q, // Tier 1: 512B
-            q / 2, // Tier 2: 1KB
-            q / 4, // Tier 3: 4KB
-            q / 16, // Tier 4: 16KB
+    pub const tier_counts = tierCountsFor(queue_size.value());
+
+    /// Derive slab tier counts from an arbitrary queue size at runtime.
+    /// Mirrors the comptime `tier_counts` formula so a client can size its
+    /// slab from its `sub_queue_size` option instead of the comptime default
+    /// (a low-rate client passes a tiny value and gets a tiny slab; a
+    /// high-throughput client passes a big value and gets a big slab). Each
+    /// tier is clamped to >= 1 so even a minimal queue size yields a valid
+    /// slab (Slab.init asserts slice_count > 0).
+    pub fn tierCountsFor(q: u32) [tier_count]u32 {
+        return [_]u32{
+            @max(1, q), // Tier 0: 256B
+            @max(1, q), // Tier 1: 512B
+            @max(1, q / 2), // Tier 2: 1KB
+            @max(1, q / 4), // Tier 3: 4KB
+            @max(1, q / 16), // Tier 4: 16KB
         };
-    };
+    }
 
     /// Max slab slice size (larger uses fallback allocator).
     pub const max_slice_size: usize = 16384;
@@ -104,11 +112,18 @@ pub const Server = struct {
 };
 
 /// Client limits.
+///
+/// These size fixed inline arrays in the Client struct (sub_ptrs,
+/// sub_backups, free_slots, sidmap_keys/vals). At the former 16384/32768 the
+/// sub_backups array alone (~331 B/entry) was ~5.4 MB of resident memory per
+/// client. Lowered to a still-generous 1024 subscriptions (sidmap kept at 2x
+/// with power-of-2 capacity for low-collision open addressing). A client that
+/// genuinely needs thousands of concurrent subscriptions must raise these.
 pub const Client = struct {
     /// Max concurrent subscriptions per client.
-    pub const max_subscriptions: u16 = 16384;
-    /// SidMap hash table capacity.
-    pub const sidmap_capacity: u32 = 32768;
+    pub const max_subscriptions: u16 = 1024;
+    /// SidMap hash table capacity (power-of-2, >= max_subscriptions).
+    pub const sidmap_capacity: u32 = 2048;
 };
 
 /// Protocol constants.
