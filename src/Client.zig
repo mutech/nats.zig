@@ -25,6 +25,7 @@ const Parser = protocol.Parser;
 const ServerInfo = protocol.ServerInfo;
 const connection = @import("connection.zig");
 const State = connection.State;
+const Waker = @import("connection/waker.zig").Waker;
 const pubsub = @import("pubsub.zig");
 const subscription_mod = @import("pubsub/subscription.zig");
 const memory = @import("memory.zig");
@@ -219,12 +220,15 @@ pub const Message = struct {
 ///
 /// Lives on the request()'s stack. The dispatcher fills `msg`
 /// with a cloned response Message and sets `done`; the request
-/// task spin-yields on `done` until the response arrives or the
-/// timeout fires.
+/// task blocks on `done` (futex) until the response arrives, the
+/// timeout fires, or it is canceled.
+///
+/// `done` is a u32 (0 = pending, 1 = done) so it can be used directly as a
+/// futex word. The dispatcher stores 1 (release) then futexWakes it.
 pub const RespWaiter = struct {
     msg: ?Message = null,
-    done: std.atomic.Value(bool) =
-        std.atomic.Value(bool).init(false),
+    done: std.atomic.Value(u32) =
+        std.atomic.Value(u32).init(0),
 };
 
 /// Lazy response multiplexer for request/reply.
@@ -305,11 +309,13 @@ pub const RespMux = struct {
             client.allocator,
             msg,
         ) catch {
-            waiter.done.store(true, .release);
+            waiter.done.store(1, .release);
+            io.futexWake(u32, &waiter.done.raw, std.math.maxInt(u32));
             return;
         };
         waiter.msg = cloned;
-        waiter.done.store(true, .release);
+        waiter.done.store(1, .release);
+        io.futexWake(u32, &waiter.done.raw, std.math.maxInt(u32));
     }
 };
 
@@ -796,8 +802,19 @@ flush_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 publish_ring: ByteRing = undefined,
 publish_ring_buf: ?[]u8 = null,
 
+/// Wakeup fd (Linux eventfd) that lets producers wake the io_task out of its
+/// blocking poll() promptly after pushing to publish_ring or on shutdown.
+/// Created in connect(), destroyed in deinit/drain after io_task has exited.
+waker: Waker = .{},
+
 // Debug counters for io_task (only used when dbg.enabled)
 io_task_stats: IoTaskStats = .{},
+
+/// Always-on count of io_task outer-loop iterations. On an idle connection
+/// the io_task blocks in poll(), so this barely advances -- tests use it to
+/// assert the client is event-driven (no busy poll / spin). Written by
+/// io_task only; read by anyone via ioTaskLoops().
+io_task_loops: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
 // Error rate-limiting state (written by io_task only)
 /// Count of protocol parse errors encountered.
@@ -1055,6 +1072,10 @@ pub fn connect(
     client.publish_ring = ByteRing.init(
         client.publish_ring_buf.?,
     );
+
+    // Wakeup fd for producer -> io_task notification (kills the busy poll).
+    client.waker = Waker.init() catch return error.OutOfMemory;
+    errdefer client.waker.deinit();
 
     client.io = io;
     client.reader = client.stream.reader(io, client.read_buffer);
@@ -2606,8 +2627,7 @@ fn requestAwaitResp(
     const map_key = reply[self.resp_mux.prefix_len..];
     const timeout_ns: u64 =
         @as(u64, timeout_ms) * std.time.ns_per_ms;
-    const start = getNowNs(self.io);
-    var spin_count: u32 = 0;
+    const deadline_ns: u64 = getNowNs(self.io) +| timeout_ns;
 
     defer {
         self.resp_mux.mutex.lockUncancelable(self.io);
@@ -2615,24 +2635,24 @@ fn requestAwaitResp(
         self.resp_mux.mutex.unlock(self.io);
     }
 
-    while (!waiter.done.load(.acquire)) {
-        spin_count += 1;
-        if (spin_count < defaults.Spin.max_spins) {
-            std.atomic.spinLoopHint();
-        } else {
-            self.io.sleep(
-                .fromNanoseconds(0),
-                .awake,
-            ) catch |err| {
-                if (err == error.Canceled)
-                    return waiter.msg;
-            };
-            spin_count = 0;
-
-            const now = getNowNs(self.io);
-            if (now -| start >= timeout_ns)
-                return waiter.msg;
-        }
+    // Block on `done` (futex word) until the dispatcher delivers the reply,
+    // the timeout expires, or the request is canceled.
+    //
+    // LOST-WAKEUP SAFETY: the dispatcher sets done=1 (release) THEN futexWakes.
+    // futexWait only parks while *done == 0, so a done=1 that lands before we
+    // park makes futexWait return immediately -- the reply is never missed.
+    while (waiter.done.load(.acquire) == 0) {
+        const now = getNowNs(self.io);
+        if (now >= deadline_ns) return waiter.msg; // timeout
+        const remaining_ns: i96 = @intCast(deadline_ns - now);
+        self.io.futexWaitTimeout(
+            u32,
+            &waiter.done.raw,
+            0,
+            .{ .duration = .{ .raw = .fromNanoseconds(remaining_ns), .clock = .awake } },
+        ) catch |err| {
+            if (err == error.Canceled) return waiter.msg;
+        };
     }
 
     return waiter.msg;
@@ -2647,7 +2667,9 @@ fn closeRespMux(self: *Client) void {
     self.resp_mux.mutex.lockUncancelable(io);
     var it = self.resp_mux.map.iterator();
     while (it.next()) |entry| {
-        entry.value_ptr.*.done.store(true, .release);
+        const waiter = entry.value_ptr.*;
+        waiter.done.store(1, .release);
+        io.futexWake(u32, &waiter.done.raw, std.math.maxInt(u32));
     }
     self.resp_mux.map.clearAndFree(self.allocator);
     self.resp_mux.mutex.unlock(io);
@@ -2831,6 +2853,8 @@ pub fn drain(self: *Client) !DrainResult {
 
             // Close queue and clear from data structures
             sub.queue.close(self.io);
+            // Wake any parked consumer so it observes the close.
+            sub.signalWaiters(self.io);
             _ = self.sidmap.remove(sub.sid);
             self.sub_ptrs[slot_idx] = null;
             if (self.cached_sub == sub) self.cached_sub = null;
@@ -2866,6 +2890,9 @@ pub fn drain(self: *Client) !DrainResult {
     // Shutdown read to unblock io_task. stream_mutex serializes
     // against io_task closing the fd during reconnect.
     self.shutdownRecvIfOpen();
+    // Wake io_task out of its blocking poll() so it observes .closed
+    // promptly (not on the coarse keepalive tick).
+    self.wakeIoTask();
     // Wait for io_task to exit
     if (self.io_task_future) |*future| {
         _ = future.cancel(self.io);
@@ -2873,6 +2900,7 @@ pub fn drain(self: *Client) !DrainResult {
     }
     // Full close -- io_task exited, no concurrent reassignment.
     self.closeIfOpen();
+    self.waker.deinit();
 
     if (self.server_info) |*info| {
         info.deinit(alloc);
@@ -2903,6 +2931,13 @@ pub fn isConnected(self: *const Client) bool {
 pub fn stats(self: *const Client) StatsSnapshot {
     assert(self.next_sid >= 1);
     return self.statistics.snapshot();
+}
+
+/// Number of io_task outer-loop iterations so far. On an idle connection the
+/// io_task blocks in poll(), so this stays nearly constant -- a proxy for
+/// "spends ~no CPU while idle". Intended for tests/diagnostics.
+pub fn ioTaskLoops(self: *const Client) u64 {
+    return self.io_task_loops.load(.monotonic);
 }
 
 /// Returns server info.
@@ -3308,10 +3343,11 @@ pub fn rtt(self: *Client) !u64 {
     }
     self.write_mutex.unlock(self.io);
 
-    // Wait for PONG - poll last_pong_received_ns
-    // io_task handles PONG and updates the timestamp
+    // Wait for PONG - poll last_pong_received_ns (updated by io_task, which is
+    // woken by the incoming PONG making the socket readable). Coarse 1ms poll
+    // bounded by the timeout: this is an explicit blocking call, not an idle
+    // path, and last_pong_received_ns is a u64 (not futex-sized).
     const timeout_ns: u64 = 5_000_000_000;
-    var spin_count: u32 = 0;
 
     while (true) {
         const current_pong_ns = self.last_pong_received_ns.load(.acquire);
@@ -3319,21 +3355,11 @@ pub fn rtt(self: *Client) !u64 {
             const end_ns = getNowNs(self.io);
             return end_ns - start_ns;
         }
-
-        spin_count += 1;
-        if (spin_count < defaults.Spin.max_spins) {
-            std.atomic.spinLoopHint();
-        } else {
-            self.io.sleep(
-                .fromNanoseconds(0),
-                .awake,
-            ) catch {};
-            spin_count = 0;
-            const now_ns = getNowNs(self.io);
-            if (now_ns - start_ns >= timeout_ns) {
-                return error.Timeout;
-            }
+        const now_ns = getNowNs(self.io);
+        if (now_ns - start_ns >= timeout_ns) {
+            return error.Timeout;
         }
+        self.io.sleep(.fromMilliseconds(1), .awake) catch {};
     }
 }
 
@@ -3470,6 +3496,8 @@ pub fn closeAllQueues(self: *Client) void {
     for (self.sub_ptrs) |maybe_sub| {
         if (maybe_sub) |sub| {
             sub.queue.close(self.io);
+            // Wake any parked consumer so it observes the close.
+            sub.signalWaiters(self.io);
         }
     }
 }
@@ -3496,6 +3524,9 @@ pub fn deinit(self: *Client) void {
     //    in cleanupForReconnect; closeIfOpen below handles the
     //    case where io_task already owns/closed the fd.
     if (was_open) self.shutdownRecvIfOpen();
+    // Wake io_task out of its blocking poll() so it observes .closed
+    // promptly (not on the coarse keepalive tick).
+    self.wakeIoTask();
 
     // 3. Wait for io_task to exit (no concurrent writers after)
     if (self.io_task_future) |*future| {
@@ -3505,6 +3536,7 @@ pub fn deinit(self: *Client) void {
 
     // 4. Full close -- io_task exited, no concurrent reassignment.
     self.closeIfOpen();
+    self.waker.deinit();
 
     // 5. Cancel callback task and free event queue
     // SAFETY: Set event_queue = null BEFORE canceling to signal callback_task
@@ -3722,6 +3754,24 @@ fn pubEncodedSize(
     return size;
 }
 
+/// Wake the io_task out of its blocking poll(). Called by any producer after
+/// pushing outbound work to publish_ring, and on shutdown. Idempotent and
+/// safe from any thread (writes the level-triggered waker fd).
+inline fn wakeIoTask(self: *Client) void {
+    self.waker.wake();
+}
+
+/// Commit an encoded entry to the outbound ring and wake the io_task.
+///
+/// LOST-WAKEUP SAFETY: the ring commit (release) is published BEFORE the wake.
+/// The waker is level-triggered, so even if the wake races the io_task's ring
+/// drain, the fd stays signalled and the next poll() returns immediately and
+/// re-drains -- the entry is never stranded until the coarse keepalive tick.
+inline fn commitRing(self: *Client, entry: []u8, len: usize) void {
+    self.publish_ring.commit(entry, len);
+    self.wakeIoTask();
+}
+
 /// Encode PUB into publish ring (lock-free).
 /// Spins briefly if ring is full, then returns error.
 fn encodePubToRing(
@@ -3780,7 +3830,7 @@ fn encodePubToRing(
     @memcpy(buf[pos..][0..2], "\r\n");
     pos += 2;
 
-    self.publish_ring.commit(entry, pos);
+    self.commitRing(entry, pos);
 }
 
 /// Encode HPUB with structured header entries into ring.
@@ -3845,7 +3895,7 @@ fn encodeHPubToRing(
     @memcpy(buf[pos..][0..2], "\r\n");
     pos += 2;
 
-    self.publish_ring.commit(entry, pos);
+    self.commitRing(entry, pos);
 }
 
 /// Encode HPUB with raw pre-encoded header bytes into ring.
@@ -3911,7 +3961,7 @@ fn encodeHPubRawToRing(
     @memcpy(buf[pos..][0..2], "\r\n");
     pos += 2;
 
-    self.publish_ring.commit(entry, pos);
+    self.commitRing(entry, pos);
 }
 
 /// Encode SUB into publish ring.
@@ -3962,7 +4012,7 @@ fn encodeSubToRing(
     @memcpy(buf[pos..][0..2], "\r\n");
     pos += 2;
 
-    self.publish_ring.commit(entry, pos);
+    self.commitRing(entry, pos);
 }
 
 /// Encode UNSUB into publish ring.
@@ -3999,7 +4049,7 @@ fn encodeUnsubToRing(
     @memcpy(buf[pos..][0..2], "\r\n");
     pos += 2;
 
-    self.publish_ring.commit(entry, pos);
+    self.commitRing(entry, pos);
 }
 
 /// Reserve a ring entry with brief spin on full.
@@ -4418,7 +4468,68 @@ pub const Subscription = struct {
     /// High watermark for pending bytes.
     max_pending_bytes: u64 = 0,
 
-    /// Spin-yield loop to pop next message from queue.
+    // Blocking-wait state (futex eventcount). Replaces the old spin loop so a
+    // consumer blocked in nextMsg()/nextMsgTimeout() uses ~no CPU while idle.
+    //   - notify_seq: bumped by io_task after routing a message, and on
+    //     teardown (unsubscribe/close). It is the futex word.
+    //   - waiters: number of consumers currently parked. Lets the io_task skip
+    //     the futexWake syscall entirely when nobody is waiting.
+    /// Futex word: incremented on every message routed or on teardown.
+    notify_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// Count of consumers currently parked in a futex wait on `notify_seq`.
+    waiters: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    /// Producer side (io_task, or teardown): publish a wakeup to any parked
+    /// consumer. The caller has already made the queue non-empty (or closed
+    /// it) BEFORE calling this.
+    ///
+    /// LOST-WAKEUP SAFETY (io_task -> consumer): seq_cst gives a single total
+    /// order over `notify_seq.fetchAdd` here and the consumer's
+    /// `waiters.fetchAdd` + `notify_seq.load`. If a consumer parks (its
+    /// futexWait sees the old seq), then its seq load preceded this fetchAdd in
+    /// that order, so its waiters++ also preceded our waiters.load -> we
+    /// observe waiters>0 and wake it. Otherwise the consumer's seq load already
+    /// saw the new value and its predicate re-check (pop) finds the message, so
+    /// it never parks. Either way: no lost wakeup.
+    fn signalWaiters(self: *Subscription, io: Io) void {
+        _ = self.notify_seq.fetchAdd(1, .seq_cst);
+        if (self.waiters.load(.seq_cst) != 0) {
+            io.futexWake(u32, &self.notify_seq.raw, std.math.maxInt(u32));
+        }
+    }
+
+    /// Park until `notify_seq` changes, the deadline passes, or canceled.
+    /// Caller MUST have re-checked its predicate (queue/state) immediately
+    /// before calling with the `observed` seq it read at that point.
+    fn parkUntilSignal(
+        self: *Subscription,
+        io: Io,
+        observed: u32,
+        deadline_ns: ?u64,
+    ) error{Canceled}!void {
+        _ = self.waiters.fetchAdd(1, .seq_cst);
+        defer _ = self.waiters.fetchSub(1, .monotonic);
+
+        if (deadline_ns) |deadline| {
+            const now = getNowNs(io);
+            if (now >= deadline) return;
+            const remaining_ns: i96 = @intCast(deadline - now);
+            io.futexWaitTimeout(
+                u32,
+                &self.notify_seq.raw,
+                observed,
+                .{ .duration = .{ .raw = .fromNanoseconds(remaining_ns), .clock = .awake } },
+            ) catch |err| {
+                if (err == error.Canceled) return error.Canceled;
+            };
+        } else {
+            io.futexWait(u32, &self.notify_seq.raw, observed) catch |err| {
+                if (err == error.Canceled) return error.Canceled;
+            };
+        }
+    }
+
+    /// Blocking loop to pop next message from queue.
     /// Internal: used by both nextMsg() and callback drain tasks.
     fn nextRaw(self: *Subscription, io: Io) !Message {
         assert(self.state == .active or self.state == .draining);
@@ -4428,18 +4539,11 @@ pub const Subscription = struct {
             .{self.queue.len()},
         );
 
-        var spin_count: u32 = 0;
-        var yield_count: u32 = 0;
-
         while (true) {
             if (self.queue.pop()) |msg| {
                 const msg_size =
                     if (msg.backing_buf) |buf| buf.len else msg.size();
                 self.pending_bytes -|= msg_size;
-                dbg.print(
-                    "Sub.nextRaw: GOT MESSAGE after {d} yields",
-                    .{yield_count},
-                );
                 return msg;
             }
             if (self.queue.isClosed()) {
@@ -4451,26 +4555,17 @@ pub const Subscription = struct {
                 return error.Closed;
             }
 
-            spin_count += 1;
-            if (spin_count < defaults.Spin.max_spins) {
-                std.atomic.spinLoopHint();
-            } else {
-                io.sleep(
-                    .fromNanoseconds(0),
-                    .awake,
-                ) catch |err| {
-                    if (err == error.Canceled)
-                        return error.Canceled;
-                };
-                spin_count = 0;
-                yield_count += 1;
-                if (yield_count % 10000 == 0) {
-                    dbg.print(
-                        "Sub.nextRaw: still waiting, yields={d}",
-                        .{yield_count},
-                    );
-                }
-            }
+            // Snapshot the futex word, then re-check the predicate before
+            // parking. If io_task routes a message (or teardown fires) after
+            // this load, notify_seq differs from `observed` and the park
+            // returns immediately (see parkUntilSignal / signalWaiters).
+            const observed = self.notify_seq.load(.seq_cst);
+            if (!self.queue.isEmpty()) continue;
+            if (self.queue.isClosed()) return error.Closed;
+            if (self.state != .active and self.state != .draining)
+                return error.Closed;
+
+            try self.parkUntilSignal(io, observed, null);
         }
     }
 
@@ -4514,8 +4609,6 @@ pub const Subscription = struct {
         assert(self.state == .active or self.state == .draining);
         assert(buf.len > 0);
 
-        var spin_count: u32 = 0;
-
         while (true) {
             const count = self.queue.popBatch(buf);
             if (count > 0) {
@@ -4538,19 +4631,14 @@ pub const Subscription = struct {
                 return error.Closed;
             }
 
-            spin_count += 1;
-            if (spin_count < defaults.Spin.max_spins) {
-                std.atomic.spinLoopHint();
-            } else {
-                io.sleep(
-                    .fromNanoseconds(0),
-                    .awake,
-                ) catch |err| {
-                    if (err == error.Canceled)
-                        return error.Canceled;
-                };
-                spin_count = 0;
-            }
+            // Block until a message is routed / teardown fires (no timeout).
+            const observed = self.notify_seq.load(.seq_cst);
+            if (!self.queue.isEmpty()) continue;
+            if (self.queue.isClosed()) return error.Closed;
+            if (self.state != .active and self.state != .draining)
+                return error.Closed;
+
+            try self.parkUntilSignal(io, observed, null);
         }
     }
 
@@ -4587,7 +4675,7 @@ pub const Subscription = struct {
         const start = getNowNs(io);
         const timeout_ns: u64 =
             @as(u64, timeout_ms) * std.time.ns_per_ms;
-        var spin_count: u32 = 0;
+        const deadline_ns: u64 = start +| timeout_ns;
 
         while (true) {
             if (self.queue.pop()) |msg| {
@@ -4607,28 +4695,17 @@ pub const Subscription = struct {
             {
                 return error.Closed;
             }
+            if (getNowNs(io) >= deadline_ns) return null;
 
-            spin_count += 1;
-            if (spin_count < defaults.Spin.max_spins) {
-                std.atomic.spinLoopHint();
-            } else {
-                // Yield to IO event loop. This:
-                // - stops burning CPU
-                // - enables future.cancel()
-                // - works in Debug mode
-                io.sleep(
-                    .fromNanoseconds(0),
-                    .awake,
-                ) catch |err| {
-                    if (err == error.Canceled)
-                        return error.Canceled;
-                };
-                spin_count = 0;
-                // Check timeout after yielding
-                const now = getNowNs(io);
-                if (now -| start >= timeout_ns)
-                    return null;
-            }
+            // Block (bounded by the deadline) until a message is routed,
+            // teardown fires, or the timeout expires. Cancellation-aware.
+            const observed = self.notify_seq.load(.seq_cst);
+            if (!self.queue.isEmpty()) continue;
+            if (self.queue.isClosed()) return error.Closed;
+            if (self.state != .active and self.state != .draining)
+                return error.Closed;
+
+            try self.parkUntilSignal(io, observed, deadline_ns);
         }
     }
 
@@ -4733,26 +4810,19 @@ pub const Subscription = struct {
         const start = getNowNs(io);
         const timeout_ns: u64 =
             @as(u64, timeout_ms) * std.time.ns_per_ms;
-        var spin_count: u32 = 0;
 
+        // Drain progress is driven by the CONSUMER popping (a different
+        // thread/task), which emits no producer signal, so we cannot futex
+        // on notify_seq here. Poll on a coarse 1ms sleep bounded by the
+        // timeout -- far below a busy spin, and only during an explicit drain.
         while (true) {
             if (self.queue.len() == 0) {
                 return;
             }
-
-            spin_count += 1;
-            if (spin_count < defaults.Spin.max_spins) {
-                std.atomic.spinLoopHint();
-            } else {
-                io.sleep(
-                    .fromNanoseconds(0),
-                    .awake,
-                ) catch {};
-                spin_count = 0;
-                const now = getNowNs(io);
-                if (now -| start >= timeout_ns)
-                    return error.Timeout;
-            }
+            const now = getNowNs(io);
+            if (now -| start >= timeout_ns)
+                return error.Timeout;
+            io.sleep(.fromMilliseconds(1), .awake) catch {};
         }
     }
 
@@ -4925,6 +4995,10 @@ pub const Subscription = struct {
                 self.max_pending_bytes = self.pending_bytes;
         }
 
+        // Message is now queued: wake any parked consumer (nextMsg/next-batch).
+        // Enqueue-then-signal under the seq_cst eventcount -> no lost wakeup.
+        self.signalWaiters(self.client.io);
+
         // Auto-unsubscribe (only when max_msgs set)
         if (self.max_msgs != null) {
             self.delivered_count += 1;
@@ -5005,6 +5079,10 @@ pub const Subscription = struct {
 
         // Mark as unsubscribed
         self.state = .unsubscribed;
+
+        // Wake any parked nextMsg()/nextMsgTimeout() so it observes the close
+        // and returns error.Closed promptly (cancellation).
+        self.signalWaiters(client.io);
 
         // Report errors after cleanup completes
         if (!can_send) return error.NotConnected;

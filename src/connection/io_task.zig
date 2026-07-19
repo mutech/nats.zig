@@ -31,15 +31,28 @@ const defaults = @import("../defaults.zig");
 
 const Message = Client.Message;
 
-/// Poll timeout when buffer empty (milliseconds).
-/// Derived from defaults.Poll.timeout_us for configurability.
-/// 0 = busy poll (from timeout_us=0), >=1 otherwise.
-const POLL_TIMEOUT_MS: i32 = if (defaults.Poll.timeout_us == 0)
-    0
-else
-    @max(1, @divFloor(defaults.Poll.timeout_us + 999, 1000));
+/// Non-blocking read poll: reads only data already available in the socket
+/// buffer, never waits. The idle wait is done separately by blockForWork().
+const READ_POLL_TIMEOUT_MS: i32 = 0;
+
+/// Health/PING re-check cadence on a busy connection (ns). On an idle
+/// connection the check runs each time blockForWork() returns (at most every
+/// keepalive backstop interval), which is well within the ping interval.
+const HEALTH_CHECK_INTERVAL_NS: u64 = 100_000_000;
 
 const Io = std.Io;
+
+/// Coarse keepalive backstop for the idle poll(), clamped so the health/PING
+/// check still fires comfortably within the client's ping interval.
+fn keepaliveTimeoutMs(client: *Client) i32 {
+    const cap = defaults.Poll.keepalive_timeout_ms;
+    const ping_ms = client.options.ping_interval_ms;
+    if (ping_ms == 0) return cap;
+    // Fire at least twice per ping interval so PINGs are timely.
+    const half: i64 = @divFloor(@as(i64, ping_ms), 2);
+    const clamped: i64 = @max(@as(i64, 1), @min(@as(i64, cap), half));
+    return @intCast(clamped);
+}
 
 /// Gets current monotonic time in nanoseconds.
 fn getNowNs(io: Io) u64 {
@@ -125,31 +138,34 @@ inline fn drainPublishRing(client: *Client) bool {
 /// Main I/O task entry point. Called via io.async() from connect().
 /// Reader: reads socket, routes MSG, responds to PING with PONG.
 /// Exits cleanly when stream is closed (close then cancel).
+///
+/// Event-driven: after processing all immediately-available work, blocks in
+/// poll([socket, waker], keepalive) until the socket becomes readable, a
+/// producer signals the waker (new outbound publish/sub/close), or the coarse
+/// keepalive backstop fires (periodic health/PING check). An idle connection
+/// therefore consumes ~no CPU -- no busy poll, no spin.
 pub fn run(client: *Client) void {
     dbg.print("io_task[fd={d}]: STARTED", .{client.stream.socket.handle});
     var loop_count: u64 = 0;
 
-    // Health check throttling (100ms interval to avoid hot-loop impact)
-    // Use iteration counter to avoid syscall every loop (~10ms at 1M loops/sec)
-    const health_check_interval_ns: u64 = 100_000_000;
-    var last_health_check_ns: u64 = 0;
-    var health_check_counter: u32 = 0;
+    const keepalive_ms = keepaliveTimeoutMs(client);
+    var last_health_check_ns: u64 = getNowNs(client.io);
 
     outer: while (true) {
         if (dbg.enabled) loop_count += 1;
+        // Always-on iteration counter (idle-CPU regression guard for tests).
+        _ = client.io_task_loops.fetchAdd(1, .monotonic);
         // HOT PATH: Exit check - intentionally non-atomic for performance.
         // Safe because of "close-then-cancel" pattern (see module doc).
         // Stale .closed read causes socket op failure, task exits anyway.
         if (client.state == .closed) break :outer;
 
-        // Periodic health check (detects stale connections when server killed)
-        // Only check timestamp every N iterations to avoid syscall overhead
-        health_check_counter +%= 1;
-        if (health_check_counter >= defaults.Spin.health_check_iterations) {
-            health_check_counter = 0;
-
+        // Periodic health check (detects stale connections when server killed).
+        // Time-gated: cheap on busy connections, and on an idle connection it
+        // runs each time blockForWork() returns (<= keepalive backstop).
+        {
             const now_ns = getNowNs(client.io);
-            if (now_ns - last_health_check_ns >= health_check_interval_ns) {
+            if (now_ns - last_health_check_ns >= HEALTH_CHECK_INTERVAL_NS) {
                 last_health_check_ns = now_ns;
                 if (client.checkHealthAndDetectStale()) {
                     // Connection stale - trigger disconnect/reconnect
@@ -167,8 +183,6 @@ pub fn run(client: *Client) void {
         }
 
         // Drain ring BEFORE reads to minimize write latency.
-        // Without this, ring drains only after the inner
-        // loop's 1ms poll timeout, starving the producer.
         if (!drainPublishRing(client)) continue :outer;
 
         var made_progress = true;
@@ -176,7 +190,7 @@ pub fn run(client: *Client) void {
             made_progress = false;
 
             // Exit inner loop when ring has pending data
-            // so we drain it without blocking in poll().
+            // so we drain it without blocking.
             if (!client.publish_ring.isEmpty()) break;
 
             drainReturnQueue(client);
@@ -191,24 +205,8 @@ pub fn run(client: *Client) void {
                 made_progress = true;
             }
             if (route_result == .disconnected) {
-                const state = State.atomicLoad(
-                    &client.state,
-                );
-                if (client.options.reconnect and
-                    state != .closed)
-                {
-                    if (!handleDisconnect(client))
-                        break :outer;
-                    continue :outer;
-                }
-                @atomicStore(
-                    State,
-                    &client.state,
-                    .closed,
-                    .release,
-                );
-                client.pushEvent(.{ .closed = {} });
-                break :outer;
+                if (handleTransportLoss(client)) break :outer;
+                continue :outer;
             }
 
             if (!made_progress) {
@@ -223,26 +221,8 @@ pub fn run(client: *Client) void {
                 if (read_result == .canceled)
                     break :outer;
                 if (read_result == .disconnected) {
-                    const state = State.atomicLoad(
-                        &client.state,
-                    );
-                    if (client.options.reconnect and
-                        state != .closed)
-                    {
-                        if (!handleDisconnect(client))
-                            break :outer;
-                        continue :outer;
-                    }
-                    @atomicStore(
-                        State,
-                        &client.state,
-                        .closed,
-                        .release,
-                    );
-                    client.pushEvent(
-                        .{ .closed = {} },
-                    );
-                    break :outer;
+                    if (handleTransportLoss(client)) break :outer;
+                    continue :outer;
                 }
                 if (read_result == .progress)
                     made_progress = true;
@@ -253,8 +233,17 @@ pub fn run(client: *Client) void {
         // produced during the inner loop).
         if (!drainPublishRing(client)) continue :outer;
 
-        // No progress - yield to allow other threads
-        std.Thread.yield() catch {};
+        // Nothing left to do right now: BLOCK until the socket is readable,
+        // a producer signals the waker, or the keepalive backstop fires.
+        // Real blocking -> an idle connection uses ~no CPU.
+        switch (blockForWork(client, keepalive_ms)) {
+            .proceed => continue :outer,
+            .closed => break :outer,
+            .disconnected => {
+                if (handleTransportLoss(client)) break :outer;
+                continue :outer;
+            },
+        }
     }
     if (dbg.enabled) {
         const stats = &client.io_task_stats;
@@ -338,6 +327,68 @@ inline fn pollForData(
     return .no_data;
 }
 
+/// Result of the idle blocking wait.
+const BlockResult = enum {
+    /// Woken by socket readable / waker / timeout: loop back and re-process.
+    proceed,
+    /// Client is shutting down: exit the io_task.
+    closed,
+    /// Socket signalled POLLHUP/POLLERR: transport lost.
+    disconnected,
+};
+
+/// Block until there is work to do: the socket becomes readable (incoming
+/// data or disconnect), a producer signals the waker (new outbound work or
+/// shutdown), or the coarse keepalive backstop fires (periodic health check).
+///
+/// This is the ONLY blocking point of the io_task; it replaces the old
+/// busy-poll + yield spin. No lock is held across poll().
+///
+/// LOST-WAKEUP SAFETY (producer -> io_task): the waker is level-triggered.
+/// A producer pushes to publish_ring and THEN signals the waker. If that
+/// signal races this drain, the waker stays readable, so the next poll()
+/// returns immediately and the caller re-runs drainPublishRing before
+/// blocking again -- the publish is never stranded on the coarse tick.
+fn blockForWork(client: *Client, keepalive_ms: i32) BlockResult {
+    // HOT PATH: non-atomic read, see module doc "close-then-cancel".
+    if (client.state == .closed) return .closed;
+
+    const sfd = client.stream.socket.handle;
+    var fds = [_]posix.pollfd{
+        .{ .fd = sfd, .events = posix.POLL.IN, .revents = 0 },
+        // waker.fd is -1 when disabled (non-Linux); poll() ignores it.
+        .{ .fd = client.waker.fd, .events = posix.POLL.IN, .revents = 0 },
+    };
+
+    // On error, fall back to a re-process cycle; the health check catches a
+    // truly dead connection on the next iteration.
+    const ready = pollSockets(&fds, keepalive_ms) catch return .proceed;
+    if (ready == 0) return .proceed; // keepalive backstop fired
+
+    // Drain the waker fully (level-triggered) so the next idle poll() blocks.
+    if ((fds[1].revents & posix.POLL.IN) != 0) client.waker.drain();
+
+    // Prioritise disconnect detection over draining partial data (reconnect
+    // recovers cleanly). Mirrors pollForData's POLLHUP handling.
+    if ((fds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0)
+        return .disconnected;
+
+    return .proceed;
+}
+
+/// Handle transport loss (disconnect). Returns true if the io_task should
+/// exit its outer loop, false if it reconnected and should continue.
+fn handleTransportLoss(client: *Client) bool {
+    const state = State.atomicLoad(&client.state);
+    if (client.options.reconnect and state != .closed) {
+        // handleDisconnect: true = reconnected (continue), false = give up.
+        return !handleDisconnect(client);
+    }
+    @atomicStore(State, &client.state, .closed, .release);
+    client.pushEvent(.{ .closed = {} });
+    return true;
+}
+
 /// Try to fill buffer without blocking forever.
 /// Uses poll() to check for data, then fillMore() to read.
 /// For TLS: loops until we get decrypted data or no more TCP data available.
@@ -367,7 +418,7 @@ inline fn tryFillBuffer(client: *Client) ReadResult {
 
             if (tcp_buffered == 0) {
                 // TCP buffer empty - poll socket for more encrypted data
-                const poll_result = pollForData(fd, POLL_TIMEOUT_MS);
+                const poll_result = pollForData(fd, READ_POLL_TIMEOUT_MS);
                 if (poll_result == .disconnected) return .disconnected;
                 if (poll_result == .no_data) {
                     if (dbg.enabled)
@@ -407,7 +458,7 @@ inline fn tryFillBuffer(client: *Client) ReadResult {
     }
 
     // Non-TLS: simple poll + read
-    const poll_result = pollForData(fd, POLL_TIMEOUT_MS);
+    const poll_result = pollForData(fd, READ_POLL_TIMEOUT_MS);
 
     if (poll_result == .disconnected) {
         return .disconnected;

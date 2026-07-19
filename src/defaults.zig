@@ -121,27 +121,18 @@ pub const Protocol = struct {
     pub const version: []const u8 = "0.1.0";
 };
 
-/// Spin/yield loop tuning constants.
-pub const Spin = struct {
-    /// Spin iterations before yielding in subscription next() loop.
-    /// After this many spins, yields to I/O runtime for cancellation support.
-    pub const max_spins: u32 = 4096;
-    /// Loop iterations between health check timestamp
-    /// reads in io_task.
-    pub const health_check_iterations: u32 = 1000000;
-    // timeout_check_iterations removed -- all spin loops
-    // now use io.sleep yield after max_spins instead.
-};
-
-/// Poll timeout configuration for io_task.
+/// io_task idle-poll configuration.
+///
+/// The io_task blocks in poll([socket, waker], keepalive_timeout_ms). It is
+/// woken promptly by socket readability (incoming data / disconnect) or by a
+/// producer signalling the waker (outbound publish/sub/close). The timeout is
+/// only a coarse backstop so the periodic health/PING check still runs while
+/// the connection is otherwise idle -- it is NOT a busy-poll interval.
 pub const Poll = struct {
-    /// Poll timeout in microseconds.
-    /// 0 = busy poll (max throughput, high CPU)
-    /// 100-500 = low latency with reduced CPU
-    /// 1000 = 1ms, balanced (default)
-    /// Values < 1000 require ppoll() on Linux for sub-ms precision.
-    /// poll() rounds up to 1ms minimum.
-    pub const timeout_us: i32 = 1000;
+    /// Coarse keepalive/health-check backstop for the idle poll() (ms).
+    /// Clamped down against the client's ping interval at runtime so PINGs
+    /// stay timely; see io_task.keepaliveTimeoutMs.
+    pub const keepalive_timeout_ms: i32 = 30_000;
 };
 
 /// Protocol limits for subjects and queue groups.
