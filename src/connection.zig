@@ -9,7 +9,6 @@ pub const events = @import("connection/events.zig");
 pub const errors = @import("connection/errors.zig");
 pub const server_pool = @import("connection/server_pool.zig");
 pub const io_task = @import("connection/io_task.zig");
-pub const waker = @import("connection/waker.zig");
 
 pub const State = state.State;
 pub const StateMachine = state.StateMachine;

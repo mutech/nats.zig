@@ -136,20 +136,6 @@ pub const Protocol = struct {
     pub const version: []const u8 = "0.1.0";
 };
 
-/// io_task idle-poll configuration.
-///
-/// The io_task blocks in poll([socket, waker], keepalive_timeout_ms). It is
-/// woken promptly by socket readability (incoming data / disconnect) or by a
-/// producer signalling the waker (outbound publish/sub/close). The timeout is
-/// only a coarse backstop so the periodic health/PING check still runs while
-/// the connection is otherwise idle -- it is NOT a busy-poll interval.
-pub const Poll = struct {
-    /// Coarse keepalive/health-check backstop for the idle poll() (ms).
-    /// Clamped down against the client's ping interval at runtime so PINGs
-    /// stay timely; see io_task.keepaliveTimeoutMs.
-    pub const keepalive_timeout_ms: i32 = 30_000;
-};
-
 /// Protocol limits for subjects and queue groups.
 /// These are compile-time limits that define backup buffer sizes.
 pub const Limits = struct {

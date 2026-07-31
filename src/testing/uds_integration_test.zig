@@ -25,6 +25,20 @@ const socket_path = "/tmp/nats-zig-uds-it.sock";
 const config_path = "/tmp/nats-zig-uds-it.conf";
 const uds_url = "nats+uds://" ++ socket_path;
 
+// TLS-over-UDS: the server's UDS accept loop runs the same createClient
+// as TCP, so a server-global tls{} block applies to UDS connections too. Second
+// server on its own socket/port with tls enabled.
+const tls_uds_tcp_port: u16 = 14244;
+const tls_socket_path = "/tmp/nats-zig-uds-tls-it.sock";
+const tls_config_path = "/tmp/nats-zig-uds-tls-it.conf";
+const tls_uds_url = "nats+uds://" ++ tls_socket_path;
+// Token auth for the TLS+UDS server: snats's UDS peer-credential (uid) auth
+// reads SO_PEERCRED off a *net.UnixConn and cannot see through the TLS wrapper
+// (getUDSPeerCreds type-asserts *net.UnixConn, which a *tls.Conn is not), so
+// uid-match auth does not compose with TLS. Token auth rides the CONNECT line
+// over the encrypted stream and is transport-agnostic.
+const uds_tls_token = "uds-tls-token";
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     utils.setProcessEnviron(init.minimal.environ);
@@ -40,6 +54,11 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     defer deleteUdsConfig(io);
+    writeUdsTlsConfig(io) catch |err| {
+        std.debug.print("Failed to write UDS+TLS config: {}\n", .{err});
+        std.process.exit(1);
+    };
+    defer std.Io.Dir.deleteFile(std.Io.Dir.cwd(), io, tls_config_path) catch {};
 
     var manager: ServerManager = .init(allocator);
     defer manager.deinit(allocator, io);
@@ -53,11 +72,21 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
+    std.debug.print("Starting UDS+TLS server (socket {s})...\n", .{tls_socket_path});
+    _ = manager.startServer(allocator, io, .{
+        .port = tls_uds_tcp_port,
+        .config_file = tls_config_path,
+    }) catch |err| {
+        std.debug.print("Failed to start UDS+TLS server: {}\n", .{err});
+        std.process.exit(1);
+    };
+
     std.debug.print("\nRunning UDS tests...\n\n", .{});
 
     testConnect(allocator);
     testPubSub(allocator);
     testRequestReply(allocator);
+    testTlsPubSub(allocator);
 
     const summary = utils.getSummary();
     std.debug.print("\n=== UDS Test Summary ===\n", .{});
@@ -263,4 +292,88 @@ fn writeUdsConfig(io: std.Io) !void {
 fn deleteUdsConfig(io: std.Io) void {
     const Dir = std.Io.Dir;
     Dir.deleteFile(Dir.cwd(), io, config_path) catch {};
+}
+
+/// Like writeUdsConfig, plus a server-global tls{} block. snats applies global
+/// TLS to the UDS listener (same createClient path as TCP), so this exercises
+/// the TLS x UDS matrix cell. Cert paths mirror configs/tls.conf (relative to
+/// the server's CWD = repo root).
+fn writeUdsTlsConfig(io: std.Io) !void {
+    const Dir = std.Io.Dir;
+
+    const file = try Dir.createFile(Dir.cwd(), io, tls_config_path, .{});
+    defer file.close(io);
+
+    var buf: [1024]u8 = undefined;
+    var writer = file.writer(io, &buf);
+    try writer.interface.print(
+        \\uds {{
+        \\  path: "{s}"
+        \\}}
+        \\tls {{
+        \\  cert_file: "src/testing/certs/server-cert.pem"
+        \\  key_file: "src/testing/certs/server-key.pem"
+        \\  ca_file: "src/testing/certs/rootCA.pem"
+        \\  timeout: 60
+        \\}}
+        \\authorization {{
+        \\  token: "{s}"
+        \\}}
+        \\
+    ,
+        .{ tls_socket_path, uds_tls_token },
+    );
+    try writer.interface.flush();
+}
+
+/// TLS over UDS: connect over the socket with TLS forced, and round-trip a
+/// message. `tls_insecure_skip_verify` because a UDS peer has no hostname to
+/// match the server cert against.
+fn testTlsPubSub(allocator: std.mem.Allocator) void {
+    const io = utils.newIo(allocator);
+    defer io.deinit();
+
+    const client = nats.Client.connect(allocator, io.io(), tls_uds_url, .{
+        .name = "uds-tls-pubsub",
+        .reconnect = false,
+        .tls_required = true,
+        .tls_insecure_skip_verify = true,
+        .auth_token = uds_tls_token,
+    }) catch |err| {
+        reportError("uds_tls_pubsub", "connect", err);
+        return;
+    };
+    defer client.deinit();
+
+    const sub = client.subscribeSync("uds.tls.echo") catch |err| {
+        reportError("uds_tls_pubsub", "subscribe", err);
+        return;
+    };
+    defer sub.deinit();
+
+    client.flush(5_000_000_000) catch |err| {
+        reportError("uds_tls_pubsub", "flush", err);
+        return;
+    };
+
+    const payload = "hello over tls+uds";
+    client.publish("uds.tls.echo", payload) catch |err| {
+        reportError("uds_tls_pubsub", "publish", err);
+        return;
+    };
+
+    const msg = (sub.nextMsgTimeout(2000) catch |err| {
+        reportError("uds_tls_pubsub", "receive", err);
+        return;
+    }) orelse {
+        reportResult("uds_tls_pubsub", false, "no message received");
+        return;
+    };
+    defer msg.deinit();
+
+    reportResult(
+        "uds_tls_pubsub",
+        std.mem.eql(u8, msg.data, payload),
+        "payload mismatch",
+    );
 }

@@ -41,6 +41,8 @@ pub const stress_subs = @import("stress_subs.zig");
 pub const jetstream = @import("jetstream.zig");
 pub const multithread = @import("multithread.zig");
 pub const micro = @import("micro.zig");
+pub const cancellation = @import("cancellation.zig");
+pub const backpressure = @import("backpressure.zig");
 
 /// Runs all client tests.
 pub fn runAll(allocator: std.mem.Allocator, manager: *ServerManager) void {
@@ -80,4 +82,6 @@ pub fn runAll(allocator: std.mem.Allocator, manager: *ServerManager) void {
     jetstream.runReconnectTests(allocator, manager);
     multithread.runAll(allocator);
     micro.runAll(allocator, manager);
+    cancellation.runAll(allocator);
+    backpressure.runAll(allocator);
 }

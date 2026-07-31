@@ -15,9 +15,6 @@
 //! Runs as async task started by Client.connect().
 
 const std = @import("std");
-const builtin = @import("builtin");
-const posix = std.posix;
-const native_os = builtin.os.tag;
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 
@@ -27,32 +24,10 @@ const protocol = @import("../protocol.zig");
 const dbg = @import("../dbg.zig");
 const memory = @import("../memory.zig");
 const TieredSlab = memory.TieredSlab;
-const defaults = @import("../defaults.zig");
 
 const Message = Client.Message;
 
-/// Non-blocking read poll: reads only data already available in the socket
-/// buffer, never waits. The idle wait is done separately by blockForWork().
-const READ_POLL_TIMEOUT_MS: i32 = 0;
-
-/// Health/PING re-check cadence on a busy connection (ns). On an idle
-/// connection the check runs each time blockForWork() returns (at most every
-/// keepalive backstop interval), which is well within the ping interval.
-const HEALTH_CHECK_INTERVAL_NS: u64 = 100_000_000;
-
 const Io = std.Io;
-
-/// Coarse keepalive backstop for the idle poll(), clamped so the health/PING
-/// check still fires comfortably within the client's ping interval.
-fn keepaliveTimeoutMs(client: *Client) i32 {
-    const cap = defaults.Poll.keepalive_timeout_ms;
-    const ping_ms = client.options.ping_interval_ms;
-    if (ping_ms == 0) return cap;
-    // Fire at least twice per ping interval so PINGs are timely.
-    const half: i64 = @divFloor(@as(i64, ping_ms), 2);
-    const clamped: i64 = @max(@as(i64, 1), @min(@as(i64, cap), half));
-    return @intCast(clamped);
-}
 
 /// Gets current monotonic time in nanoseconds.
 fn getNowNs(io: Io) u64 {
@@ -75,189 +50,211 @@ inline fn drainReturnQueue(client: *Client) void {
     }
 }
 
-/// Drain publish ring to socket. Returns false on write error
-/// (caller should continue :outer to retry). Also handles
-/// auto-flush for non-publish writes (SUB, UNSUB).
-inline fn drainPublishRing(client: *Client) bool {
-    if (!client.publish_ring.isEmpty()) {
-        if (State.atomicLoad(&client.state) == .connected) {
-            client.write_mutex.lock(
-                client.io,
-            ) catch return true;
-            if (State.atomicLoad(&client.state) ==
-                .connected)
-            {
-                while (client.publish_ring.peek()) |data| {
-                    client.active_writer.writeAll(
-                        data,
-                    ) catch {
-                        client.write_mutex.unlock(
-                            client.io,
-                        );
-                        return false;
-                    };
-                    client.publish_ring.advance();
-                }
-                // REVIEWED(2025-03): flush catch {} is intentional.
-                // Next write detects failure and triggers reconnect.
-                client.active_writer.flush() catch {};
-                if (client.use_tls) {
-                    client.writer.interface.flush() catch {};
-                }
-            }
-            client.write_mutex.unlock(client.io);
-            _ = client.flush_requested.swap(
-                false,
-                .acquire,
-            );
-        }
-    } else if (client.flush_requested.load(.monotonic)) {
-        // Auto-flush for non-publish writes (SUB, UNSUB)
-        if (client.flush_requested.swap(false, .acquire)) {
-            if (State.atomicLoad(&client.state) ==
-                .connected)
-            {
-                client.write_mutex.lock(
-                    client.io,
-                ) catch return true;
-                defer client.write_mutex.unlock(client.io);
-                if (State.atomicLoad(&client.state) ==
-                    .connected)
-                {
-                    client.active_writer.flush() catch {};
-                    if (client.use_tls) {
-                        client.writer.interface.flush() catch {};
-                    }
-                }
-            }
-        }
-    }
-    return true;
-}
+/// Reader unit. Blocks on the socket via `fillMore` (evented on zio, a
+/// blocking recv on Threaded -- no poll(2)), parses and routes MSG/HMSG into the
+/// per-sub queues, flags server PINGs for the writer, records PONGs, and owns the
+/// reconnect state machine. Takes no `write_mutex` in steady state, so a
+/// backpressured writer never stalls inbound delivery.
+pub fn readerRun(client: *Client) void {
+    dbg.print("reader[fd={d}]: STARTED", .{client.stream.socket.handle});
 
-/// Main I/O task entry point. Called via io.async() from connect().
-/// Reader: reads socket, routes MSG, responds to PING with PONG.
-/// Exits cleanly when stream is closed (close then cancel).
-///
-/// Event-driven: after processing all immediately-available work, blocks in
-/// poll([socket, waker], keepalive) until the socket becomes readable, a
-/// producer signals the waker (new outbound publish/sub/close), or the coarse
-/// keepalive backstop fires (periodic health/PING check). An idle connection
-/// therefore consumes ~no CPU -- no busy poll, no spin.
-pub fn run(client: *Client) void {
-    dbg.print("io_task[fd={d}]: STARTED", .{client.stream.socket.handle});
-    var loop_count: u64 = 0;
-
-    const keepalive_ms = keepaliveTimeoutMs(client);
-    var last_health_check_ns: u64 = getNowNs(client.io);
-
-    outer: while (true) {
-        if (dbg.enabled) loop_count += 1;
+    reader: while (true) {
         // Always-on iteration counter (idle-CPU regression guard for tests).
         _ = client.io_task_loops.fetchAdd(1, .monotonic);
-        // HOT PATH: Exit check - intentionally non-atomic for performance.
-        // Safe because of "close-then-cancel" pattern (see module doc).
-        // Stale .closed read causes socket op failure, task exits anyway.
-        if (client.state == .closed) break :outer;
+        // Close-then-cancel: teardown sets .closed then cancels this future;
+        // the top-of-loop check makes the reader exit promptly once unblocked.
+        if (client.state == .closed) break :reader;
 
-        // Periodic health check (detects stale connections when server killed).
-        // Time-gated: cheap on busy connections, and on an idle connection it
-        // runs each time blockForWork() returns (<= keepalive backstop).
-        {
-            const now_ns = getNowNs(client.io);
-            if (now_ns - last_health_check_ns >= HEALTH_CHECK_INTERVAL_NS) {
-                last_health_check_ns = now_ns;
-                if (client.checkHealthAndDetectStale()) {
-                    // Connection stale - trigger disconnect/reconnect
-                    const state = State.atomicLoad(&client.state);
-                    if (client.options.reconnect and state != .closed) {
-                        if (!handleDisconnect(client)) break :outer;
-                        continue :outer;
-                    }
-                    // Reconnect disabled - set closed state before exiting
-                    @atomicStore(State, &client.state, .closed, .release);
-                    client.pushEvent(.{ .closed = {} });
-                    break :outer;
-                }
-            }
-        }
-
-        // Drain ring BEFORE reads to minimize write latency.
-        if (!drainPublishRing(client)) continue :outer;
-
-        var made_progress = true;
-        while (made_progress) {
-            made_progress = false;
-
-            // Exit inner loop when ring has pending data
-            // so we drain it without blocking.
-            if (!client.publish_ring.isEmpty()) break;
-
-            drainReturnQueue(client);
-
-            const route_result =
-                tryRouteBufferedMessages(client);
-            if (route_result == .progress) {
-                dbg.print(
-                    "io_task[fd={d}]: routed messages",
-                    .{client.stream.socket.handle},
-                );
-                made_progress = true;
-            }
-            if (route_result == .disconnected) {
-                if (handleTransportLoss(client)) break :outer;
-                continue :outer;
-            }
-
-            if (!made_progress) {
-                const read_result = tryFillBuffer(client);
-                if (read_result == .progress) {
-                    dbg.print(
-                        "io_task[fd={d}]: read data" ++
-                            " from socket",
-                        .{client.stream.socket.handle},
-                    );
-                }
-                if (read_result == .canceled)
-                    break :outer;
-                if (read_result == .disconnected) {
-                    if (handleTransportLoss(client)) break :outer;
-                    continue :outer;
-                }
-                if (read_result == .progress)
-                    made_progress = true;
-            }
-        }
-
-        // Drain ring AFTER reads (catches new entries
-        // produced during the inner loop).
-        if (!drainPublishRing(client)) continue :outer;
-
-        // Nothing left to do right now: BLOCK until the socket is readable,
-        // a producer signals the waker, or the keepalive backstop fires.
-        // Real blocking -> an idle connection uses ~no CPU.
-        switch (blockForWork(client, keepalive_ms)) {
-            .proceed => continue :outer,
-            .closed => break :outer,
+        // Route complete frames already sitting in the read buffer.
+        switch (tryRouteBufferedMessages(client)) {
             .disconnected => {
-                if (handleTransportLoss(client)) break :outer;
-                continue :outer;
+                if (handleTransportLoss(client)) break :reader;
+                continue :reader;
             },
+            else => {},
+        }
+
+        // Reclaim freed POOL buffers. The reader is the sole owner of the tier
+        // free lists (it allocs on route and frees here), so pool frees stay
+        // race-free. Fallback (slab-overflow) buffers do NOT come through here --
+        // producers free those directly (Message.deinit -> slab.freeFallback),
+        // which is why the fixed-size return queue can never overflow.
+        drainReturnQueue(client);
+
+        // Block for more socket data.
+        switch (tryFillBlocking(client)) {
+            .canceled => break :reader,
+            .disconnected => {
+                if (handleTransportLoss(client)) break :reader;
+                continue :reader;
+            },
+            .progress, .no_progress => continue :reader,
         }
     }
-    if (dbg.enabled) {
-        const stats = &client.io_task_stats;
-        dbg.print(
-            "io_task: EXITED loops={d} fill_calls={d} buffered_hits={d} " ++
-                "poll_timeouts={d} read_ok={d}",
-            .{
-                loop_count,
-                stats.fill_calls,
-                stats.fill_buffered_hits,
-                stats.fill_poll_timeouts,
-                stats.fill_read_success,
-            },
-        );
+    dbg.print("reader: EXITED", .{});
+}
+
+/// Writer unit. Parks on the writer eventcount with a timeout of "time to
+/// the next PING", so keepalive folds in (no third unit). On each wake, under
+/// `write_mutex`: emit any pending PONGs, drain the publish ring frame by frame,
+/// flush both layers, then do the time-gated health/PING step. A write error or
+/// a stale connection is handed to the reader (which owns teardown/reconnect) via
+/// `transport_failed` + `shutdownRecvIfOpen`; the writer never writes `state`.
+pub fn writerRun(client: *Client) void {
+    dbg.print("writer: STARTED", .{});
+    const ping_ms = client.options.ping_interval_ms;
+
+    writer: while (true) {
+        if (client.state == .closed) break :writer;
+
+        // Snapshot the wake seq BEFORE doing work / re-checking, so a producer
+        // that bumps it during this iteration is not lost (we re-check work
+        // below and, failing that, park on this observed value).
+        const observed = client.wake_seq.load(.seq_cst);
+
+        if (State.atomicLoad(&client.state) == .connected and
+            !client.transport_failed.load(.acquire))
+        {
+            drainWriter(client);
+            // Time-gated client PING + stale detection (folded into the writer).
+            if (client.checkHealthAndDetectStale()) {
+                // Stale: hand off to the reader. The writer never writes state.
+                client.transport_failed.store(true, .release);
+                client.shutdownRecvIfOpen();
+            }
+        }
+
+        if (client.state == .closed) break :writer;
+
+        // Re-check for outstanding work before parking (lost-wakeup safety).
+        if (State.atomicLoad(&client.state) == .connected and
+            !client.transport_failed.load(.acquire) and
+            (!client.publish_ring.isEmpty() or
+                client.pong_pending.load(.monotonic) != 0 or
+                client.flush_requested.load(.monotonic)))
+        {
+            continue :writer;
+        }
+
+        // Park until woken or the next PING is due. deadline 0 = untimed
+        // (keepalive disabled): never a busy 0-timeout loop.
+        //
+        // The keepalive deadline only applies while connected: only then does
+        // the health step above run and advance `last_ping_sent_ns`. While
+        // disconnected/reconnecting that step is skipped, so a ping-based
+        // deadline would stay pinned in the past and `parkWriter` would return
+        // at once every iteration -- a busy spin. On a single-threaded executor
+        // that spin starves the reader fiber that owns the reconnect loop, so
+        // its backoff sleep never fires and reconnect stalls. When not
+        // connected there is nothing to ping: park untimed until the reader
+        // signals the writer (it calls `signalWriter` after a reconnect, and
+        // teardown cancels this future), so the executor is free for the reader.
+        var deadline_ns: u64 = 0;
+        if (ping_ms != 0 and
+            State.atomicLoad(&client.state) == .connected and
+            !client.transport_failed.load(.acquire))
+        {
+            const last_ping = client.last_ping_sent_ns.load(.monotonic);
+            deadline_ns = last_ping +| @as(u64, ping_ms) * 1_000_000;
+        }
+        client.parkWriter(observed, deadline_ns);
+    }
+    dbg.print("writer: EXITED", .{});
+}
+
+/// Blocking read for the reader unit: fills the reader buffer via `fillMore`
+/// (no poll). On teardown the reader future is cancelled and/or the recv side is
+/// shut down, so `fillMore` returns Canceled / EndOfStream promptly.
+fn tryFillBlocking(client: *Client) ReadResult {
+    if (State.atomicLoad(&client.state) == .closed) return .canceled;
+    const reader = client.active_reader;
+    const before = reader.buffered().len;
+    reader.fillMore() catch |err| {
+        if (err == error.Canceled) return .canceled;
+        if (err == error.EndOfStream or
+            err == error.ConnectionResetByPeer or
+            err == error.BrokenPipe or
+            err == error.NotOpenForReading)
+        {
+            return .disconnected;
+        }
+        // Any other read failure is transport loss too (e.g. a cancelled recv
+        // surfaces as ReadFailed); the top-of-loop .closed check handles a
+        // teardown, otherwise the reader reconnects.
+        return .disconnected;
+    };
+    return if (reader.buffered().len > before) .progress else .no_progress;
+}
+
+/// Writer half of the drain: emit pending PONGs, drain the publish ring frame by
+/// frame (advance only after a whole frame's writeAll so an error leaves the
+/// frame intact for re-send), flush both layers, and on a write error hand off
+/// to the reader. Runs under `write_mutex`.
+fn drainWriter(client: *Client) void {
+    const gen = client.conn_generation.load(.acquire);
+    client.write_mutex.lock(client.io) catch return;
+
+    if (State.atomicLoad(&client.state) != .connected or
+        client.transport_failed.load(.acquire))
+    {
+        client.write_mutex.unlock(client.io);
+        return;
+    }
+
+    var write_err = false;
+
+    // Pending PONGs first: one per server PING, so the server's ping accounting
+    // stays correct. Do not coalesce.
+    const npong = client.pong_pending.swap(0, .acq_rel);
+    var i: u32 = 0;
+    while (i < npong) : (i += 1) {
+        client.active_writer.writeAll("PONG\r\n") catch {
+            write_err = true;
+            break;
+        };
+    }
+
+    if (!write_err) {
+        while (client.publish_ring.peek()) |data| {
+            client.active_writer.writeAll(data) catch {
+                write_err = true;
+                break;
+            };
+            client.publish_ring.advance();
+        }
+    }
+
+    if (!write_err) {
+        client.active_writer.flush() catch {
+            write_err = true;
+        };
+        if (!write_err and client.use_tls) {
+            client.writer.interface.flush() catch {
+                write_err = true;
+            };
+        }
+    }
+
+    _ = client.flush_requested.swap(false, .acquire);
+
+    if (write_err) {
+        // Generation-guarded: act only if this is still the same live
+        // connection, so a stale error can't tear down a socket a concurrent
+        // reconnect already replaced. Set transport_failed before releasing the
+        // lock (the reader's cleanupForReconnect takes write_mutex, so the
+        // handoff must not race the swap).
+        if (client.conn_generation.load(.acquire) == gen and
+            State.atomicLoad(&client.state) == .connected)
+        {
+            client.transport_failed.store(true, .release);
+        }
+    }
+
+    client.write_mutex.unlock(client.io);
+
+    if (write_err and client.transport_failed.load(.acquire)) {
+        // Signal the reader (owns teardown/reconnect). Lock already released.
+        client.shutdownRecvIfOpen();
     }
 }
 
@@ -269,113 +266,6 @@ const ReadResult = enum {
     canceled,
 };
 
-/// Result of poll() operation for disconnect detection.
-const PollResult = enum {
-    has_data,
-    no_data,
-    disconnected,
-};
-
-/// Cross-platform socket poll.
-/// std.posix.poll has a Windows codepath that calls
-/// windows.poll which does not exist in this Zig version.
-/// Use WSAPoll directly on Windows.
-fn pollSockets(
-    fds: []posix.pollfd,
-    timeout: i32,
-) posix.PollError!usize {
-    if (native_os == .windows) {
-        const ws2 = std.os.windows.ws2_32;
-        const rc = ws2.WSAPoll(
-            fds.ptr,
-            @intCast(fds.len),
-            timeout,
-        );
-        if (rc == ws2.SOCKET_ERROR)
-            return error.NetworkDown;
-        return @intCast(rc);
-    }
-    return posix.poll(fds, timeout);
-}
-
-/// Poll socket for readable data with timeout (cross-platform).
-/// Also detects disconnect via POLLHUP/POLLERR.
-/// On Linux, POLLIN and POLLHUP can both be set when there's
-/// buffered data AND the connection is closing. POLLHUP is prioritized
-/// to detect dead connections even with buffered data.
-inline fn pollForData(
-    fd: posix.socket_t,
-    timeout_ms: i32,
-) PollResult {
-    var fds = [_]posix.pollfd{.{
-        .fd = fd,
-        .events = posix.POLL.IN,
-        .revents = 0,
-    }};
-    const ready = pollSockets(&fds, timeout_ms) catch return .no_data;
-    if (ready == 0) return .no_data;
-
-    // Single load, combined checks (avoid 3 separate loads)
-    const revents = fds[0].revents;
-    // REVIEWED(2025-03): POLLHUP prioritized over POLLIN intentionally.
-    // Dead connection detection is more important than draining
-    // partial data; reconnect recovers cleanly.
-    if ((revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0)
-        return .disconnected;
-
-    if ((revents & posix.POLL.IN) != 0) return .has_data;
-    return .no_data;
-}
-
-/// Result of the idle blocking wait.
-const BlockResult = enum {
-    /// Woken by socket readable / waker / timeout: loop back and re-process.
-    proceed,
-    /// Client is shutting down: exit the io_task.
-    closed,
-    /// Socket signalled POLLHUP/POLLERR: transport lost.
-    disconnected,
-};
-
-/// Block until there is work to do: the socket becomes readable (incoming
-/// data or disconnect), a producer signals the waker (new outbound work or
-/// shutdown), or the coarse keepalive backstop fires (periodic health check).
-///
-/// This is the ONLY blocking point of the io_task; it replaces the old
-/// busy-poll + yield spin. No lock is held across poll().
-///
-/// LOST-WAKEUP SAFETY (producer -> io_task): the waker is level-triggered.
-/// A producer pushes to publish_ring and THEN signals the waker. If that
-/// signal races this drain, the waker stays readable, so the next poll()
-/// returns immediately and the caller re-runs drainPublishRing before
-/// blocking again -- the publish is never stranded on the coarse tick.
-fn blockForWork(client: *Client, keepalive_ms: i32) BlockResult {
-    // HOT PATH: non-atomic read, see module doc "close-then-cancel".
-    if (client.state == .closed) return .closed;
-
-    const sfd = client.stream.socket.handle;
-    var fds = [_]posix.pollfd{
-        .{ .fd = sfd, .events = posix.POLL.IN, .revents = 0 },
-        // waker.fd is -1 when disabled (non-Linux); poll() ignores it.
-        .{ .fd = client.waker.fd, .events = posix.POLL.IN, .revents = 0 },
-    };
-
-    // On error, fall back to a re-process cycle; the health check catches a
-    // truly dead connection on the next iteration.
-    const ready = pollSockets(&fds, keepalive_ms) catch return .proceed;
-    if (ready == 0) return .proceed; // keepalive backstop fired
-
-    // Drain the waker fully (level-triggered) so the next idle poll() blocks.
-    if ((fds[1].revents & posix.POLL.IN) != 0) client.waker.drain();
-
-    // Prioritise disconnect detection over draining partial data (reconnect
-    // recovers cleanly). Mirrors pollForData's POLLHUP handling.
-    if ((fds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0)
-        return .disconnected;
-
-    return .proceed;
-}
-
 /// Handle transport loss (disconnect). Returns true if the io_task should
 /// exit its outer loop, false if it reconnected and should continue.
 fn handleTransportLoss(client: *Client) bool {
@@ -385,111 +275,11 @@ fn handleTransportLoss(client: *Client) bool {
         return !handleDisconnect(client);
     }
     @atomicStore(State, &client.state, .closed, .release);
+    // Reconnect disabled (or already closing): same terminal-close wake as the
+    // give-up path, so parked nextMsg/request/flush return promptly.
+    client.wakeBlockedOnClose();
     client.pushEvent(.{ .closed = {} });
     return true;
-}
-
-/// Try to fill buffer without blocking forever.
-/// Uses poll() to check for data, then fillMore() to read.
-/// For TLS: loops until we get decrypted data or no more TCP data available.
-/// This handles TLS record fragmentation where a record spans multiple TCP segments.
-inline fn tryFillBuffer(client: *Client) ReadResult {
-    if (dbg.enabled) client.io_task_stats.fill_calls += 1;
-    // HOT PATH: Non-atomic read - see module doc "State checks (hot path)"
-    if (client.state == .closed) return .canceled;
-
-    const reader = client.active_reader;
-    const fd = client.stream.socket.handle;
-    const before = reader.buffered().len;
-    if (dbg.enabled) client.io_task_stats.fill_buffered_hits += before;
-
-    // TLS: loop until we decrypt data or truly no more data available.
-    // Key insight: encrypted data may be in TCP reader's buffer (not socket).
-    // After TLS decrypts one record, more encrypted records may remain in the
-    // TCP buffer. poll() only sees the socket, not the TCP reader's buffer!
-    // So we must: 1) check TCP buffer first, 2) only poll if TCP buffer empty.
-    if (client.use_tls) {
-        while (true) {
-            // Atomic read: race with deinit closing socket before fillMore()
-            if (State.atomicLoad(&client.state) == .closed) return .canceled;
-
-            // Check if TCP reader has buffered encrypted data (poll can't see this)
-            const tcp_buffered = client.reader.interface.buffered().len;
-
-            if (tcp_buffered == 0) {
-                // TCP buffer empty - poll socket for more encrypted data
-                const poll_result = pollForData(fd, READ_POLL_TIMEOUT_MS);
-                if (poll_result == .disconnected) return .disconnected;
-                if (poll_result == .no_data) {
-                    if (dbg.enabled)
-                        client.io_task_stats.fill_poll_timeouts += 1;
-                    // No more data anywhere - return what we have
-                    return if (reader.buffered().len > before)
-                        .progress
-                    else
-                        .no_progress;
-                }
-            }
-            // Either TCP buffer has data, or poll said socket has data
-
-            reader.fillMore() catch |err| {
-                if (err == error.Canceled) return .canceled;
-                if (err == error.EndOfStream or
-                    err == error.ConnectionResetByPeer or
-                    err == error.BrokenPipe or
-                    err == error.NotOpenForReading)
-                {
-                    return .disconnected;
-                }
-                // Other errors: check if we made progress before failing
-                return if (reader.buffered().len > before)
-                    .progress
-                else
-                    .no_progress;
-            };
-
-            // Got decrypted data - success
-            if (reader.buffered().len > before) {
-                if (dbg.enabled) client.io_task_stats.fill_read_success += 1;
-                return .progress;
-            }
-            // No decrypted data yet - TLS needs more data, loop
-        }
-    }
-
-    // Non-TLS: simple poll + read
-    const poll_result = pollForData(fd, READ_POLL_TIMEOUT_MS);
-
-    if (poll_result == .disconnected) {
-        return .disconnected;
-    }
-    if (poll_result == .no_data) {
-        if (dbg.enabled) client.io_task_stats.fill_poll_timeouts += 1;
-        return .no_progress;
-    }
-
-    // Atomic read: race with deinit closing socket before fillMore()
-    if (State.atomicLoad(&client.state) == .closed) return .canceled;
-
-    // Socket has data -> fillMore() will return immediately
-    reader.fillMore() catch |err| {
-        if (err == error.Canceled) return .canceled;
-        if (err == error.EndOfStream or
-            err == error.ConnectionResetByPeer or
-            err == error.BrokenPipe or
-            err == error.NotOpenForReading)
-        {
-            return .disconnected;
-        }
-        return .no_progress;
-    };
-
-    const after = reader.buffered().len;
-    if (after > before) {
-        if (dbg.enabled) client.io_task_stats.fill_read_success += 1;
-        return .progress;
-    }
-    return .no_progress;
 }
 
 /// Route buffered messages (no I/O, buffer processing only).
@@ -559,19 +349,21 @@ inline fn tryRouteBufferedMessages(
                     client.statistics.bytes_in += args.total_len;
                 },
                 .ping => {
-                    client.write_mutex.lock(client.io) catch
-                        return .disconnected;
-                    defer client.write_mutex.unlock(client.io);
-                    client.active_writer.writeAll("PONG\r\n") catch {
-                        return .disconnected;
-                    };
-                    client.active_writer.flush() catch return .disconnected;
+                    // The reader never takes write_mutex to PONG (a
+                    // backpressured writer holding it would stall the reader).
+                    // Flag the pending PONG and wake the writer, which emits it.
+                    _ = client.pong_pending.fetchAdd(1, .monotonic);
+                    client.signalWriter();
                 },
                 .pong => {
                     const now = getNowNs(client.io);
                     dbg.print("Got PONG, storing timestamp={d}", .{now});
                     client.pings_outstanding.store(0, .monotonic);
                     client.last_pong_received_ns.store(now, .release);
+                    // Wake any flush() parked on the PONG eventcount. The store
+                    // above is release; signalPong's seq bump is seq_cst, so a
+                    // waking flush observes the fresh timestamp too.
+                    client.signalPong();
                 },
                 .info => |info| {
                     // REVIEWED(2025-03): server_info replacement
@@ -679,6 +471,7 @@ inline fn routeMessageToSub(
         .backing_buf = buf,
         .return_queue = &client.return_queue,
         .return_lock = &client.return_lock,
+        .slab = &client.tiered_slab,
     };
 
     sub.pushMessage(msg) catch {
@@ -769,6 +562,7 @@ inline fn routeHMessageToSub(
         .backing_buf = buf,
         .return_queue = &client.return_queue,
         .return_lock = &client.return_lock,
+        .slab = &client.tiered_slab,
     };
 
     sub.pushMessage(msg) catch {
@@ -802,10 +596,23 @@ fn handleDisconnect(client: *Client) bool {
             dbg.print("Failed to restore subscriptions after reconnect", .{});
         };
 
+        // New connection epoch: a write-error from the writer captured on the
+        // old socket is now stale and must be ignored (generation guard).
+        _ = client.conn_generation.fetchAdd(1, .monotonic);
+        client.transport_failed.store(false, .release);
+        // Re-arm the writer (drain ring-buffered publishes, resume PING) and
+        // release any flush() parked across the reconnect (it returns an error;
+        // its PING went out on the dead socket).
+        client.signalWriter();
+        client.signalPong();
+
         client.pushEvent(.{ .reconnected = {} });
         return true;
     } else {
         @atomicStore(State, &client.state, .closed, .release);
+        // Reconnect gave up: wake anyone parked in nextMsg/request/flush so they
+        // return a closed error now, not after deinit.
+        client.wakeBlockedOnClose();
         client.pushEvent(.{ .closed = {} });
         return false;
     }

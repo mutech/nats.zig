@@ -117,7 +117,10 @@ pub fn testNextBlocksThenWakes(allocator: std.mem.Allocator) void {
     defer sub.deinit();
     io.io().sleep(.fromMilliseconds(100), .awake) catch {};
 
-    // Park a consumer on nextMsg with a bounded timeout.
+    // Park a consumer on nextMsg with a bounded timeout. The awaited message
+    // (or, on the bail-out paths, the still-pending one) is freed exactly once
+    // by this deferred cancel -- do NOT also deinit it inside the await block
+    // below, or the cached result is returned and its buffer freed twice.
     var future = io.io().async(nats.Client.Sub.nextMsg, .{sub});
     defer if (future.cancel(io.io())) |msg| msg.deinit() else |_| {};
 
@@ -137,7 +140,6 @@ pub fn testNextBlocksThenWakes(allocator: std.mem.Allocator) void {
     };
 
     if (future.await(io.io())) |msg| {
-        defer msg.deinit();
         if (std.mem.eql(u8, msg.data, "hi")) {
             reportResult("event_driven_next_wakes", true, "");
             return;

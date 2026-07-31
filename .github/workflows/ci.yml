@@ -31,7 +31,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Zig
         uses: mlugg/setup-zig@v2
@@ -58,15 +58,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Both backends (threaded default + evented zio) across Debug/ReleaseFast.
+        # zio is a lazy dependency fetched only for the -Dio_backend=zio entries.
         include:
-          - mode: Debug
+          - mode: threaded-Debug
             args: ""
-          - mode: ReleaseFast
+          - mode: threaded-ReleaseFast
             args: -Doptimize=ReleaseFast
+          - mode: zio-Debug
+            args: -Dio_backend=zio
+          - mode: zio-ReleaseFast
+            args: -Doptimize=ReleaseFast -Dio_backend=zio
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Zig
         uses: mlugg/setup-zig@v2
@@ -75,7 +81,7 @@ jobs:
           cache-key: integration-${{ matrix.mode }}
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: "1.25"
 
