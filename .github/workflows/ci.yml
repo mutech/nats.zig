@@ -83,7 +83,10 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: "1.25"
+          # Must satisfy the nats-server fork's go.mod (currently >= 1.26, and it
+          # tracks nats-io main which bumps periodically). "stable" matches
+          # nats-server's own CI and avoids re-pinning on every bump.
+          go-version: "stable"
 
       - name: Build nats-server (UDS fork)
         shell: bash
