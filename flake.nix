@@ -118,8 +118,9 @@
       # log, wall time and exit code to summary.tsv and to the cross-session
       # timings file. No timeouts. All targets run even if one fails.
       #   qa fast   server pin, fmt-check, build, unit tests, UDS integration
-      #   qa full   + every integration suite x every CI matrix mode
-      #             (Debug, ReleaseFast, zio, ReleaseFast+zio)
+      #   qa full   + unit tests in ReleaseFast, every integration suite x every CI
+      #             matrix mode (Debug, ReleaseFast, zio, ReleaseFast+zio), and the
+      #             idle-client footprint benchmark
       qa = pkgs.writeShellApplication {
         name = "qa";
         excludeShellChecks = [ "SC2329" ]; # targets are dispatched via "t_$name"
@@ -137,6 +138,36 @@
           t_fmt_check() { zig build fmt-check; }
           t_build()     { zig build; }
           t_unit()      { zig build test; }
+          # Unit tests in ReleaseFast too (CI's build job runs Debug only; the slab's
+          # debug asserts and the release code paths differ).
+          t_unit_releasefast() { zig build test -Doptimize=ReleaseFast; }
+          # Idle-client footprint baseline over UDS and TCP (measurement; the output
+          # is the result). Starts its own pinned server on a private socket and a
+          # random TCP port, so it neither needs nor disturbs anything else.
+          t_bench_footprint() {
+            local d pid port rc=0
+            d="$(mktemp -d)"
+            cat > "$d/server.conf" <<EOF
+          listen: 127.0.0.1:-1
+          uds { path: "$d/s.sock" }
+          authorization { users = [
+            { user: "bench-uds", uds { match { uid: $(id -u) } }, permissions { publish { allow: [">"] }, subscribe { allow: [">"] } } }
+            { user: "bench", password: "bench" }
+          ] }
+          EOF
+            nats-server -c "$d/server.conf" > "$d/server.log" 2>&1 &
+            pid=$!
+            until [ -S "$d/s.sock" ] && grep -q 'Server is ready' "$d/server.log"; do
+              kill -0 "$pid" 2>/dev/null || { cat "$d/server.log"; return 1; }
+              sleep 0.2
+            done
+            port="$(sed -n 's/.*Listening for client connections on 127\.0\.0\.1:\([0-9]*\).*/\1/p' "$d/server.log")"
+            echo "--- UDS"; NATS_URL="nats+uds://$d/s.sock" zig build bench-footprint -Doptimize=ReleaseFast || rc=1
+            echo "--- TCP"; NATS_URL="nats://bench:bench@127.0.0.1:$port" zig build bench-footprint -Doptimize=ReleaseFast || rc=1
+            kill "$pid"; wait "$pid" || true
+            echo "--- server log"; cat "$d/server.log"; rm -rf "$d"
+            return "$rc"
+          }
 
           # Matrix modes as in ci.yml's integration job.
           mode_args() {
@@ -159,8 +190,9 @@
           done
 
           fast_targets="server fmt_check build unit uds_debug"
-          full_targets="server fmt_check build unit"
+          full_targets="server fmt_check build unit unit_releasefast"
           for m in $modes; do full_targets="$full_targets uds_$m core_$m micro_$m tls_$m"; done
+          full_targets="$full_targets bench_footprint"
 
           stage="''${1:-}"; shift || true
           case "$stage" in
