@@ -192,7 +192,7 @@
       };
     in {
       devShells.${system}.default = pkgs.mkShell {
-        packages = [ zig natscli goLatest pkgs.git buildNatsServerFork pkgs.mergiraf rerereTrain qa ];
+        packages = [ zig natscli goLatest pkgs.git buildNatsServerFork rerereTrain qa ];
 
         shellHook = ''
           root="$(git rev-parse --show-toplevel)"
