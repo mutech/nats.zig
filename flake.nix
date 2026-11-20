@@ -70,34 +70,48 @@
         installPhase = ''install -Dm755 -t $out/bin "$(find . -type f -name nats -print -quit)"'';
       };
 
-      # CI builds mutech/nats-server@main from source (no releases for the UDS
-      # fork). Locally a sibling checkout (the system-nats superproject layout)
-      # wins, so unpushed server changes are what the client is tested against.
+      # CI builds the UDS server fork from source at the commit pinned in
+      # .github/workflows/ci.yml (NATS_SERVER_FORK_REPO/REF), with Go `stable`.
+      # build-nats-server-fork reads that pin and builds exactly it, so local runs
+      # test against the same server as CI. Building a local checkout instead (the
+      # integration step of an upstream sync, before the pin is bumped) must be
+      # explicit: `build-nats-server-fork DIR` or NATS_SERVER_FORK_DIR=DIR.
+      # The built ref is recorded next to the binary; the shellHook warns when it
+      # no longer matches the pin.
+      goLatest =
+        let names = lib.filter (n: builtins.match "go_1_[0-9]+" n != null) (builtins.attrNames pkgs);
+            minor = n: lib.toInt (lib.removePrefix "go_1_" n);
+        in pkgs.${lib.last (lib.sort (a: b: minor a < minor b)
+             (lib.filter (n: (builtins.tryEval pkgs.${n}).success) names))};
+
       buildNatsServerFork = pkgs.writeShellApplication {
         name = "build-nats-server-fork";
-        runtimeInputs = [ pkgs.go pkgs.git ];
+        runtimeInputs = [ goLatest pkgs.git pkgs.gnugrep pkgs.gnused ];
         text = ''
           root="$(git rev-parse --show-toplevel)"
+          ci="$root/.github/workflows/ci.yml"
+          ci_var() { sed -n "s/^[[:space:]]*$1:[[:space:]]*\(.*\)$/\1/p" "$ci" | head -n1; }
+          repo="$(ci_var NATS_SERVER_FORK_REPO)"; ref="$(ci_var NATS_SERVER_FORK_REF)"
+          out="$root/.devshell/bin"; mkdir -p "$out"
           src="''${1:-''${NATS_SERVER_FORK_DIR:-}}"
-          if [ -z "$src" ] && [ -e "$root/../nats-server/.git" ]; then
-            src="$root/../nats-server"
-          fi
-          if [ -z "$src" ]; then
+          if [ -n "$src" ]; then
+            built="local:$(cd "$src" && pwd)@$(git -C "$src" rev-parse HEAD)$(git -C "$src" diff --quiet || echo +dirty)"
+          else
             src="''${XDG_CACHE_HOME:-$HOME/.cache}/nats-fork-devshell/nats-server-src"
-            if [ -d "$src/.git" ]; then
-              git -C "$src" pull -q --ff-only
-            else
-              git clone -q --depth 1 --branch main https://github.com/mutech/nats-server.git "$src"
-            fi
+            [ -d "$src/.git" ] || git clone -q --filter=blob:none "$repo" "$src"
+            git -C "$src" cat-file -e "$ref^{commit}" 2>/dev/null || git -C "$src" fetch -q origin
+            git -C "$src" checkout -q --detach "$ref"
+            built="$ref"
           fi
-          echo "building nats-server from $src ($(git -C "$src" rev-parse --short HEAD))"
-          go -C "$src" build -o "$root/.devshell/bin/nats-server" .
-          "$root/.devshell/bin/nats-server" --version
+          echo "building nats-server: $built"
+          go -C "$src" build -o "$out/nats-server" .
+          echo "$built" > "$out/nats-server.ref"
+          "$out/nats-server" --version
         '';
       };
     in {
       devShells.${system}.default = pkgs.mkShell {
-        packages = [ zig natscli pkgs.go pkgs.git buildNatsServerFork ];
+        packages = [ zig natscli goLatest pkgs.git buildNatsServerFork ];
 
         shellHook = ''
           root="$(git rev-parse --show-toplevel)"
@@ -112,9 +126,14 @@
           zon="$(sed -n 's/.*minimum_zig_version = "\([^"]*\)".*/\1/p' build.zig.zon 2>/dev/null)"
           [ -z "$zon" ] || [ "$zon" = "${versions.zig}" ] \
             || echo "  WARNING: build.zig.zon minimum_zig_version $zon != CI ZIG_VERSION ${versions.zig}"
-          # A stock nats-server elsewhere on PATH lacks UDS; require the fork build.
-          [ -x "$root/.devshell/bin/nats-server" ] \
-            || echo "  no fork nats-server in .devshell/bin: run build-nats-server-fork"
+          # A stock nats-server elsewhere on PATH lacks UDS; require the fork build,
+          # at the commit CI pins.
+          pin="$(sed -n 's/^[[:space:]]*NATS_SERVER_FORK_REF:[[:space:]]*//p' .github/workflows/ci.yml | head -n1)"
+          if [ ! -x "$root/.devshell/bin/nats-server" ]; then
+            echo "  no fork nats-server in .devshell/bin: run build-nats-server-fork"
+          elif [ "$(cat "$root/.devshell/bin/nats-server.ref" 2>/dev/null)" != "$pin" ]; then
+            echo "  NOTE: .devshell/bin/nats-server is $(cat "$root/.devshell/bin/nats-server.ref" 2>/dev/null || echo unknown), CI pins $pin"
+          fi
         '';
       };
     };

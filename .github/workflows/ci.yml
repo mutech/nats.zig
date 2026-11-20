@@ -21,7 +21,10 @@ env:
   # from source. Point these at the fork repo/ref to test against it.
   # The repo must be publicly cloneable (or add credentials to the step).
   NATS_SERVER_FORK_REPO: https://github.com/mutech/nats-server.git
-  NATS_SERVER_FORK_REF: main
+  # Pinned server commit this client was last integrated against. Bumping it is
+  # its own commit (integration step of the upstream sync), so a test failure
+  # is attributable to either the client change or the server bump.
+  NATS_SERVER_FORK_REF: 168064a8aa18cef4e09e01ec116560b720615615
 
 jobs:
   build:
@@ -94,8 +97,9 @@ jobs:
           set -euo pipefail
 
           mkdir -p "$HOME/.local/bin"
-          git clone --depth 1 --branch "${NATS_SERVER_FORK_REF}" \
+          git clone --filter=blob:none \
             "${NATS_SERVER_FORK_REPO}" "$RUNNER_TEMP/nats-server-fork"
+          git -C "$RUNNER_TEMP/nats-server-fork" checkout --detach "${NATS_SERVER_FORK_REF}"
           go -C "$RUNNER_TEMP/nats-server-fork" build \
             -o "$HOME/.local/bin/nats-server" .
 
