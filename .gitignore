@@ -5,3 +5,7 @@ zig-out/
 tmp/
 .mcp.json
 .claude/
+
+# Fork dev shell (flake.nix): direnv cache, fork nats-server build
+.direnv/
+.devshell/
