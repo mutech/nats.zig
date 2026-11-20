@@ -109,9 +109,90 @@
           "$out/nats-server" --version
         '';
       };
+
+      rerereTrain = pkgs.writeShellScriptBin "rerere-train" ''
+        exec ${pkgs.bash}/bin/bash ${pkgs.git}/share/git/contrib/rerere-train.sh "$@"
+      '';
+
+      # QA runner mirroring ci.yml. Every target's full output goes to its own
+      # log, wall time and exit code to summary.tsv and to the cross-session
+      # timings file. No timeouts. All targets run even if one fails.
+      #   qa fast   server pin, fmt-check, build, unit tests, UDS integration
+      #   qa full   + every integration suite x every CI matrix mode
+      #             (Debug, ReleaseFast, zio, ReleaseFast+zio)
+      qa = pkgs.writeShellApplication {
+        name = "qa";
+        excludeShellChecks = [ "SC2329" ]; # targets are dispatched via "t_$name"
+        runtimeInputs = [ pkgs.coreutils pkgs.gnused pkgs.git ];
+        text = ''
+          root="$(git rev-parse --show-toplevel)"
+          cd "$root"
+          export PATH="$root/.devshell/bin:$PATH"
+          pin="$(sed -n 's/^[[:space:]]*NATS_SERVER_FORK_REF:[[:space:]]*//p' .github/workflows/ci.yml | head -n1)"
+
+          t_server() {
+            [ "$(cat .devshell/bin/nats-server.ref 2>/dev/null)" = "$pin" ] || build-nats-server-fork
+            nats-server --version; cat .devshell/bin/nats-server.ref
+          }
+          t_fmt_check() { zig build fmt-check; }
+          t_build()     { zig build; }
+          t_unit()      { zig build test; }
+
+          # Matrix modes as in ci.yml's integration job.
+          mode_args() {
+            case "$1" in
+              debug) ;;
+              releasefast) echo "-Doptimize=ReleaseFast" ;;
+              zio) echo "-Dio_backend=zio" ;;
+              releasefast_zio) echo "-Doptimize=ReleaseFast -Dio_backend=zio" ;;
+            esac
+          }
+          suite() { local step="$1" mode="$2" args; args="$(mode_args "$mode")"
+                    # shellcheck disable=SC2086
+                    zig build "$step" $args; }
+          modes="debug releasefast zio releasefast_zio"
+          for m in $modes; do
+            eval "t_uds_$m()   { suite test-integration-uds $m; }"
+            eval "t_core_$m()  { suite test-integration $m; }"
+            eval "t_micro_$m() { suite test-integration-micro $m; }"
+            eval "t_tls_$m()   { suite test-integration-tls $m; }"
+          done
+
+          fast_targets="server fmt_check build unit uds_debug"
+          full_targets="server fmt_check build unit"
+          for m in $modes; do full_targets="$full_targets uds_$m core_$m micro_$m tls_$m"; done
+
+          stage="''${1:-}"; shift || true
+          case "$stage" in
+            fast) targets="''${*:-$fast_targets}" ;;
+            full) targets="''${*:-$full_targets}" ;;
+            list) echo "fast: $fast_targets"; echo "full: $full_targets"; exit 0 ;;
+            *) echo "usage: qa fast|full|list [TARGET...]" >&2; exit 2 ;;
+          esac
+
+          rev="$(git rev-parse --short HEAD)$(git diff --quiet || echo +dirty)"
+          dir="$root/.devshell/qa/$(date -u +%Y%m%dT%H%M%SZ)-$stage"
+          timings="''${XDG_STATE_HOME:-$HOME/.local/state}/snats-upstream-sync/timings.tsv"
+          mkdir -p "$dir" "$(dirname "$timings")"
+          [ -s "$timings" ] || printf 'date\trepo\trev\tstage\ttarget\tseconds\trc\thost\n' > "$timings"
+          echo "qa $stage @ $rev (server pin ''${pin:0:9}) -> $dir"
+          failed=0
+          for t in $targets; do
+            start=$(date +%s); set +e
+            ( set -x; "t_$t" ) > "$dir/$t.log" 2>&1; rc=$?
+            set -e; secs=$(( $(date +%s) - start ))
+            printf '%s\t%s\t%s\n' "$t" "$secs" "$rc" >> "$dir/summary.tsv"
+            printf '%s\tnats.zig\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$rev" "$stage" "$t" "$secs" "$rc" "$(hostname)" >> "$timings"
+            printf '  %-24s rc=%-3s %6ss\n' "$t" "$rc" "$secs"
+            [ "$rc" -eq 0 ] || failed=1
+          done
+          echo "logs: $dir"
+          exit "$failed"
+        '';
+      };
     in {
       devShells.${system}.default = pkgs.mkShell {
-        packages = [ zig natscli goLatest pkgs.git buildNatsServerFork ];
+        packages = [ zig natscli goLatest pkgs.git buildNatsServerFork pkgs.mergiraf rerereTrain qa ];
 
         shellHook = ''
           root="$(git rev-parse --show-toplevel)"
