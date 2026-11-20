@@ -9,3 +9,4 @@ tmp/
 # Fork dev shell (flake.nix): direnv cache, fork nats-server build
 .direnv/
 .devshell/
+zig-pkg/
