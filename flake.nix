@@ -171,8 +171,11 @@
           esac
 
           rev="$(git rev-parse --short HEAD)$(git diff --quiet || echo +dirty)"
-          dir="$root/.devshell/qa/$(date -u +%Y%m%dT%H%M%SZ)-$stage"
-          timings="''${XDG_STATE_HOME:-$HOME/.local/state}/snats-upstream-sync/timings.tsv"
+          # Logs and timings live outside the tree (linters such as codespell walk
+          # it), next to each other under the upstream-sync state dir.
+          state="''${XDG_STATE_HOME:-$HOME/.local/state}/snats-upstream-sync"
+          dir="$state/qa/nats.zig/$(date -u +%Y%m%dT%H%M%SZ)-$stage"
+          timings="$state/timings.tsv"
           mkdir -p "$dir" "$(dirname "$timings")"
           [ -s "$timings" ] || printf 'date\trepo\trev\tstage\ttarget\tseconds\trc\thost\n' > "$timings"
           echo "qa $stage @ $rev (server pin ''${pin:0:9}) -> $dir"
