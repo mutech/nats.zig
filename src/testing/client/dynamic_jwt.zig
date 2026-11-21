@@ -23,13 +23,13 @@ const config_path = "/tmp/nats-dynamic-jwt-test.conf";
 const Dir = std.Io.Dir;
 
 /// Deterministic keypair seeds for reproducibility.
-const op_raw_seed = [_]u8{11} ** 32;
-const acct_raw_seed = [_]u8{22} ** 32;
-const user_raw_seed = [_]u8{33} ** 32;
+const op_raw_seed = @as([32]u8, @splat(11));
+const acct_raw_seed = @as([32]u8, @splat(22));
+const user_raw_seed = @as([32]u8, @splat(33));
 // nats-server runs JetStream, which requires a configured system account; without one
 // the server fatals on startup ("system account not setup"). Generate a minimal
 // operator-signed system account and wire it into the config.
-const sys_raw_seed = [_]u8{44} ** 32;
+const sys_raw_seed = @as([32]u8, @splat(44));
 
 /// Generates all keypairs and JWTs, writes config.
 /// Returns formatted credentials string in out_creds.
@@ -234,7 +234,7 @@ pub fn testDynamicJwtConnect(
         },
     ) catch |err| {
         var ebuf: [64]u8 = undefined;
-        const detail = std.fmt.bufPrint(
+        const detail = std.mem.print(
             &ebuf,
             "connect: {}",
             .{err},
@@ -298,7 +298,7 @@ pub fn testDynamicJwtPubSub(
         },
     ) catch |err| {
         var ebuf: [64]u8 = undefined;
-        const detail = std.fmt.bufPrint(
+        const detail = std.mem.print(
             &ebuf,
             "connect: {}",
             .{err},

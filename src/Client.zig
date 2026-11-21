@@ -624,11 +624,11 @@ pub fn parseUrl(url: []const u8) error{InvalidUrl}!ParsedUrl {
     var user: ?[]const u8 = null;
     var pass: ?[]const u8 = null;
 
-    if (std.mem.indexOf(u8, remaining, "@")) |at_pos| {
+    if (std.mem.find(u8, remaining, "@")) |at_pos| {
         const auth = remaining[0..at_pos];
         remaining = remaining[at_pos + 1 ..];
 
-        if (std.mem.indexOf(u8, auth, ":")) |colon_pos| {
+        if (std.mem.find(u8, auth, ":")) |colon_pos| {
             user = auth[0..colon_pos];
             pass = auth[colon_pos + 1 ..];
         } else {
@@ -655,7 +655,7 @@ pub fn parseUrl(url: []const u8) error{InvalidUrl}!ParsedUrl {
     var port: u16 = 4222;
 
     if (remaining[0] == '[') {
-        const end = std.mem.indexOfScalar(u8, remaining, ']') orelse
+        const end = std.mem.findScalar(u8, remaining, ']') orelse
             return error.InvalidUrl;
         host = remaining[1..end];
         const after = remaining[end + 1 ..];
@@ -2759,8 +2759,7 @@ fn ensureRespMux(self: *Client) !void {
     defer allocator.free(base);
     assert(base.len > 0);
 
-    const prefix = try std.fmt.allocPrint(
-        allocator,
+    const prefix = try allocator.print(
         "{s}.",
         .{base},
     );
@@ -2768,7 +2767,7 @@ fn ensureRespMux(self: *Client) !void {
 
     // wildcard = "<base>.*" — the trailing dot is in prefix already.
     var wildcard_buf: [256]u8 = undefined;
-    const wildcard = std.fmt.bufPrint(
+    const wildcard = std.mem.print(
         &wildcard_buf,
         "{s}*",
         .{prefix},
@@ -2822,7 +2821,7 @@ fn requestPrepReply(
         self.resp_mux.next_token.fetchAdd(1, .monotonic),
     );
 
-    const reply = std.fmt.bufPrint(
+    const reply = std.mem.print(
         reply_buf,
         "{s}{s}",
         .{ self.resp_mux.prefix.?, token },
@@ -3306,7 +3305,7 @@ pub fn checkCompatibility(
 
     // Parse patch (strip suffix like "-beta" if present)
     var patch_clean = patch_str;
-    if (std.mem.indexOfScalar(u8, patch_str, '-')) |idx| {
+    if (std.mem.findScalar(u8, patch_str, '-')) |idx| {
         patch_clean = patch_str[0..idx];
     }
     const patch = std.fmt.parseInt(u16, patch_clean, 10) catch 0;
@@ -3444,7 +3443,7 @@ pub fn connectedAddr(
         assert(info.port > 0);
 
         // Format "host:port" into buffer
-        const result = std.fmt.bufPrint(buf, "{s}:{d}", .{
+        const result = std.mem.print(buf, "{s}:{d}", .{
             info.host,
             info.port,
         }) catch return null;
@@ -3466,7 +3465,7 @@ pub fn connectedUrlRedacted(
     const url = self.original_url[0..self.original_url_len];
 
     // Check if URL has credentials (look for @ in URL)
-    const at_pos = std.mem.indexOf(u8, url, "@") orelse {
+    const at_pos = std.mem.find(u8, url, "@") orelse {
         // No credentials, return as-is
         if (buf.len < url.len) return null;
         @memcpy(buf[0..url.len], url);
@@ -3482,7 +3481,7 @@ pub fn connectedUrlRedacted(
     }
 
     const auth_part = url[prefix_len..at_pos];
-    const colon_pos = std.mem.indexOf(u8, auth_part, ":") orelse {
+    const colon_pos = std.mem.find(u8, auth_part, ":") orelse {
         // No password (just token or user), return as-is
         if (buf.len < url.len) return null;
         @memcpy(buf[0..url.len], url);
@@ -4461,7 +4460,7 @@ fn bufferPendingPublish(
 
     // Write payload length
     var len_buf: [10]u8 = undefined;
-    const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{payload.len}) catch {
+    const len_str = std.mem.print(&len_buf, "{d}", .{payload.len}) catch {
         return error.EncodingFailed;
     };
     try writer.writeAll(len_str);

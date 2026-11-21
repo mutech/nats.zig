@@ -3,16 +3,15 @@
     .version = "0.1.0",
     // Changing fingerprint has security and trust implications.
     .fingerprint = 0x31f7624fb15addf7,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         // Test/example-only. The library takes `io: std.Io` and depends on
         // nothing; this backend lets the suite and examples run on zio's evented
-        // Io. `lazy` so consumers of the `nats` module never fetch it. Pinned
-        // past the v0.16.0 tag: it lacks required fixes to cross-thread wakeups
-        // and timed-wait cancellation (zio 7e517a6, f6983a3, eb0a408).
+        // Io. `lazy` so consumers of the `nats` module never fetch it. Release
+        // v0.20.1; kept at the latest zio release each upstream sync.
         .zio = .{
-            .url = "git+https://github.com/lalinsky/zio#5e75fbe9b1af80369189efc3fcf1bfa6d337330f",
-            .hash = "zio-0.16.0-xHbVVOtfJAAANRCJKT7erFSWuE0St8GZDHcEMoxWaEPj",
+            .url = "git+https://github.com/lalinsky/zio#c0a6b5877c9bbc71d2d2c0b3374ce7fa61a4ec12",
+            .hash = "zio-0.20.1-xHbVVI0wLwDgE2dXWDCWH0UfCQYEhnBYHs1Td12oAGeR",
             .lazy = true,
         },
     },

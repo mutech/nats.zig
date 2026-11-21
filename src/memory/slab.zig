@@ -75,7 +75,7 @@ pub const Slab = struct {
             @as(*u32, @ptrCast(@alignCast(slice.ptr))).* = next;
         }
 
-        if (builtin.mode == .Debug) {
+        if (builtin.optimize == .debug) {
             const nbytes = (@as(usize, slice_count) + 7) / 8;
             const bits = std.heap.page_allocator.alloc(u8, nbytes) catch {
                 std.heap.page_allocator.free(raw);
@@ -91,7 +91,7 @@ pub const Slab = struct {
     /// Release page-allocated memory.
     pub fn deinit(self: *Slab) void {
         std.heap.page_allocator.free(self.memory);
-        if (builtin.mode == .Debug and self.free_bits.len > 0) {
+        if (builtin.optimize == .debug and self.free_bits.len > 0) {
             std.heap.page_allocator.free(self.free_bits);
         }
         self.* = undefined;
@@ -107,7 +107,7 @@ pub const Slab = struct {
         self.free_head = @as(*u32, @ptrCast(@alignCast(slice.ptr))).*;
         self.alloc_count += 1;
 
-        if (builtin.mode == .Debug) {
+        if (builtin.optimize == .debug) {
             // Slot is now allocated: clear its free bit.
             const shift: u3 = @intCast(idx & 7);
             self.free_bits[idx >> 3] &= ~(@as(u8, 1) << shift);
@@ -122,7 +122,7 @@ pub const Slab = struct {
         const idx = self.ptrToIndex(ptr);
         assert(idx < self.slice_count);
 
-        if (builtin.mode == .Debug) {
+        if (builtin.optimize == .debug) {
             // The slot's free bit must be clear (currently allocated). A set
             // bit means it is already on the free list -> double free.
             const shift: u3 = @intCast(idx & 7);
@@ -310,8 +310,8 @@ pub const TieredSlab = struct {
     }
 
     pub const Stats = struct {
-        tier_alloc_counts: [Config.TIER_COUNT]u32 = .{0} ** Config.TIER_COUNT,
-        tier_capacities: [Config.TIER_COUNT]u32 = .{0} ** Config.TIER_COUNT,
+        tier_alloc_counts: [Config.TIER_COUNT]u32 = @splat(0),
+        tier_capacities: [Config.TIER_COUNT]u32 = @splat(0),
         fallback_count: u32 = 0,
 
         /// Total allocated across all tiers.
