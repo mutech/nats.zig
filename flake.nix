@@ -150,7 +150,8 @@
             [ "$(cat .devshell/bin/nats-server.ref 2>/dev/null)" = "$pin" ] || build-nats-server-fork
             nats-server --version; cat .devshell/bin/nats-server.ref
           }
-          t_fmt_check() { zig build fmt-check; }
+          # build.zig's fmt-check covers src, doc and build.zig; bench/ is ours.
+          t_fmt_check() { zig build fmt-check && zig fmt --check bench; }
           t_build()     { zig build; }
           t_unit()      { zig build test; }
           # Unit tests in ReleaseFast too (CI's build job runs Debug only; the slab's
