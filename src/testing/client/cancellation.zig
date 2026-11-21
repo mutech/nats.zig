@@ -220,7 +220,7 @@ fn testFlushCancel(allocator: std.mem.Allocator) void {
     // ping_interval large so the client's own keepalive never fires (which would
     // otherwise flag the silent peer stale and close before we cancel).
     var url_buf: [96]u8 = undefined;
-    const url = std.fmt.bufPrint(&url_buf, "nats+uds://{s}", .{path}) catch {
+    const url = std.mem.print(&url_buf, "nats+uds://{s}", .{path}) catch {
         reportResult("cancel_flush", false, "url fmt failed");
         return;
     };
@@ -275,7 +275,7 @@ fn testConnectCancel(allocator: std.mem.Allocator) void {
     defer _ = mock.cancel(the_io);
 
     var url_buf: [96]u8 = undefined;
-    const url = std.fmt.bufPrint(&url_buf, "nats+uds://{s}", .{path}) catch {
+    const url = std.mem.print(&url_buf, "nats+uds://{s}", .{path}) catch {
         reportResult("cancel_connect", false, "url fmt failed");
         return;
     };

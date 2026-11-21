@@ -59,7 +59,7 @@ pub fn testPublishWhileIdle(allocator: std.mem.Allocator) void {
     // (old 1ms) would be ~1000, a spin far more. Generous bound.
     if (loops_idle > 50) {
         var buf: [96]u8 = undefined;
-        const m = std.fmt.bufPrint(
+        const m = std.mem.print(
             &buf,
             "io_task not idle: {d} loops in 1s",
             .{loops_idle},

@@ -245,7 +245,7 @@ fn testRequestReply(allocator: std.mem.Allocator) void {
 
 fn reportError(name: []const u8, step: []const u8, err: anyerror) void {
     var buf: [128]u8 = undefined;
-    const details = std.fmt.bufPrint(
+    const details = std.mem.print(
         &buf,
         "{s}: {s}",
         .{ step, @errorName(err) },

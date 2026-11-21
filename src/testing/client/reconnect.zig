@@ -205,7 +205,7 @@ fn racePublisher(state: *RaceState) void {
     var n: usize = 0;
     while (!state.stop.load(.acquire)) {
         var buf: [32]u8 = undefined;
-        const m = std.fmt.bufPrint(&buf, "race-{d}", .{n}) catch continue;
+        const m = std.mem.print(&buf, "race-{d}", .{n}) catch continue;
         if (state.client.publish("race.reconnect", m)) |_| {
             state.published += 1;
         } else |_| {}

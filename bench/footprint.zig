@@ -84,7 +84,7 @@ fn readCpuTicks(io: Io) !u64 {
     var buf: [4096]u8 = undefined;
     const stat = try Io.Dir.cwd().readFile(io, "/proc/self/stat", &buf);
 
-    const rparen = std.mem.lastIndexOfScalar(u8, stat, ')') orelse
+    const rparen = std.mem.findScalarLast(u8, stat, ')') orelse
         return error.UnexpectedStatFormat;
     var it = std.mem.tokenizeScalar(u8, stat[rparen + 1 ..], ' ');
 

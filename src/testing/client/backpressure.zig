@@ -126,7 +126,7 @@ fn testTransientBackpressure(allocator: std.mem.Allocator) void {
     defer mock.await(the_io);
 
     var url_buf: [96]u8 = undefined;
-    const url = std.fmt.bufPrint(&url_buf, "nats+uds://{s}", .{path}) catch {
+    const url = std.mem.print(&url_buf, "nats+uds://{s}", .{path}) catch {
         reportResult("transient_backpressure", false, "url fmt failed");
         return;
     };
@@ -218,7 +218,7 @@ fn testHalfOpenStaleTrigger(allocator: std.mem.Allocator) void {
     defer _ = mock.cancel(the_io);
 
     var url_buf: [96]u8 = undefined;
-    const url = std.fmt.bufPrint(&url_buf, "nats+uds://{s}", .{path}) catch {
+    const url = std.mem.print(&url_buf, "nats+uds://{s}", .{path}) catch {
         reportResult("halfopen_stale_trigger", false, "url fmt failed");
         return;
     };
