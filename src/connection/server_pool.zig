@@ -16,6 +16,61 @@ pub const MAX_URL_LEN: u16 = defaults.Server.max_url_len;
 /// Cooldown period after failure before retry (ns).
 const FAILURE_COOLDOWN_NS: u64 = defaults.Server.failure_cooldown_ns;
 
+/// URL scheme prefix of UNIX domain socket URLs. Matched without the `//`, so
+/// that `nats+uds:/abs` is a UDS URL too and never falls through to TCP.
+pub const uds_scheme = "nats+uds:";
+
+/// Parts of a nats+uds URL, as slices into the URL.
+pub const UdsUrl = struct {
+    user: ?[]const u8 = null,
+    pass: ?[]const u8 = null,
+    /// Absolute socket path, verbatim.
+    path: []const u8,
+};
+
+/// Parses a URL starting with `uds_scheme`. Permissive, as nats.py's
+/// contract: any URL whose remainder after `nats+uds:` starts with `/` is
+/// accepted (`nats+uds:/abs`, `nats+uds:///abs`). Userinfo is taken only from
+/// a `//` authority before the path, so an `@` inside the path stays part of
+/// the path; a host in the authority is ignored. Rejected is what cannot mean
+/// a socket: a port, query, fragment, or a missing or relative path.
+pub fn parseUdsUrl(url: []const u8) error{InvalidUrl}!UdsUrl {
+    assert(std.mem.startsWith(u8, url, uds_scheme));
+    var rest = url[uds_scheme.len..];
+    if (std.mem.findAny(u8, rest, "?#") != null) return error.InvalidUrl;
+
+    var result: UdsUrl = .{ .path = undefined };
+    if (std.mem.startsWith(u8, rest, "//")) {
+        rest = rest[2..];
+        const authority_end = std.mem.findScalar(u8, rest, '/') orelse
+            return error.InvalidUrl;
+        var host = rest[0..authority_end];
+        rest = rest[authority_end..];
+        if (std.mem.findScalarLast(u8, host, '@')) |at| {
+            const userinfo = host[0..at];
+            host = host[at + 1 ..];
+            if (std.mem.findScalar(u8, userinfo, ':')) |colon| {
+                result.user = userinfo[0..colon];
+                result.pass = userinfo[colon + 1 ..];
+            } else {
+                result.user = userinfo;
+            }
+        }
+        // A port (any `:` after the host, past an IPv6 literal) cannot
+        // apply to a socket.
+        const port_from = if (host.len > 0 and host[0] == '[')
+            std.mem.findScalar(u8, host, ']') orelse return error.InvalidUrl
+        else
+            0;
+        if (std.mem.findScalar(u8, host[port_from..], ':') != null)
+            return error.InvalidUrl;
+    }
+    if (rest.len < 2 or rest[0] != '/') return error.InvalidUrl;
+    result.path = rest;
+    assert(result.path.len >= 2 and result.path[0] == '/');
+    return result;
+}
+
 /// Server entry in the pool.
 pub const Server = struct {
     url: [MAX_URL_LEN]u8 = undefined,
@@ -87,10 +142,18 @@ pub const ServerPool = struct {
             remaining = remaining[6..];
             server.host_start = 6;
             server.use_tls = true;
-        } else if (std.mem.startsWith(u8, remaining, "nats+uds://")) {
-            remaining = remaining["nats+uds://".len..];
-            server.host_start = "nats+uds://".len;
+        } else if (std.mem.startsWith(u8, remaining, uds_scheme)) {
+            // The socket path is the host; there is no port.
+            const path = (try parseUdsUrl(url)).path;
+            if (path.len > 255) return error.InvalidUrl;
+            server.host_start = @intCast(@intFromPtr(path.ptr) - @intFromPtr(url.ptr));
+            server.host_len = @intCast(path.len);
+            server.port = 0;
             server.is_uds = true;
+            assert(server.host_len > 0);
+            self.servers[self.count] = server;
+            self.count += 1;
+            return;
         } else if (std.mem.startsWith(u8, remaining, "nats://")) {
             remaining = remaining[7..];
             server.host_start = 7;
@@ -99,19 +162,6 @@ pub const ServerPool = struct {
         if (std.mem.find(u8, remaining, "@")) |at_pos| {
             remaining = remaining[at_pos + 1 ..];
             server.host_start += @intCast(at_pos + 1);
-        }
-
-        // For nats+uds the remainder is the socket path verbatim; there is
-        // no host/port to split out.
-        if (server.is_uds) {
-            if (remaining.len == 0 or remaining.len > 255)
-                return error.InvalidUrl;
-            server.host_len = @intCast(remaining.len);
-            server.port = 0;
-            assert(server.host_len > 0);
-            self.servers[self.count] = server;
-            self.count += 1;
-            return;
         }
 
         if (remaining.len > 0 and remaining[0] == '[') {
@@ -400,6 +450,87 @@ test "server pool nats+uds with user" {
 
 test "server pool nats+uds missing path" {
     try std.testing.expectError(error.InvalidUrl, ServerPool.init("nats+uds://"));
+}
+
+test "parseUdsUrl accepts path forms" {
+    const Case = struct {
+        url: []const u8,
+        path: []const u8,
+        user: ?[]const u8 = null,
+        pass: ?[]const u8 = null,
+    };
+    const cases = [_]Case{
+        .{ .url = "nats+uds:///tmp/x.sock", .path = "/tmp/x.sock" },
+        .{ .url = "nats+uds:/tmp/x.sock", .path = "/tmp/x.sock" },
+        .{ .url = "nats+uds://localhost/tmp/x.sock", .path = "/tmp/x.sock" },
+        .{ .url = "nats+uds://[::1]/tmp/x.sock", .path = "/tmp/x.sock" },
+        .{ .url = "nats+uds:///tmp/dir:weird/x.sock", .path = "/tmp/dir:weird/x.sock" },
+        // An `@` in the path is part of the path, never userinfo.
+        .{ .url = "nats+uds:///run/a@b/s.sock", .path = "/run/a@b/s.sock" },
+        .{ .url = "nats+uds:/run/a@b/s.sock", .path = "/run/a@b/s.sock" },
+        .{
+            .url = "nats+uds://user:pass@/tmp/x.sock",
+            .path = "/tmp/x.sock",
+            .user = "user",
+            .pass = "pass",
+        },
+        .{ .url = "nats+uds://user@/tmp/x.sock", .path = "/tmp/x.sock", .user = "user" },
+        .{
+            .url = "nats+uds://u:p@localhost/run/a@b/s.sock",
+            .path = "/run/a@b/s.sock",
+            .user = "u",
+            .pass = "p",
+        },
+    };
+    for (cases) |c| {
+        const parsed = try parseUdsUrl(c.url);
+        try std.testing.expectEqualStrings(c.path, parsed.path);
+        if (c.user) |u| {
+            try std.testing.expectEqualStrings(u, parsed.user.?);
+        } else try std.testing.expect(parsed.user == null);
+        if (c.pass) |pw| {
+            try std.testing.expectEqualStrings(pw, parsed.pass.?);
+        } else try std.testing.expect(parsed.pass == null);
+    }
+}
+
+test "parseUdsUrl rejects what cannot be a socket" {
+    const urls = [_][]const u8{
+        "nats+uds://localhost:4222/tmp/x.sock",
+        "nats+uds://:4222/tmp/x.sock",
+        "nats+uds://user:pass@localhost:4222/tmp/x.sock",
+        "nats+uds://[::1]:4222/tmp/x.sock",
+        "nats+uds:",
+        "nats+uds:/",
+        "nats+uds://",
+        "nats+uds:///",
+        "nats+uds:relative.sock",
+        "nats+uds://sock",
+        "nats+uds://localhost",
+        "nats+uds://user@",
+        "nats+uds:///tmp/x.sock?mode=rw",
+        "nats+uds:///tmp/x.sock#frag",
+        "nats+uds:/tmp/x.sock?mode=rw",
+    };
+    for (urls) |url| {
+        try std.testing.expectError(error.InvalidUrl, parseUdsUrl(url));
+    }
+}
+
+test "server pool nats+uds forms" {
+    var pool = try ServerPool.init("nats+uds:/run/snats/snats.sock");
+    try pool.addServer("nats+uds:///run/a@b/s.sock");
+    try std.testing.expectEqual(@as(u8, 2), pool.count);
+    try std.testing.expect(pool.servers[0].is_uds);
+    try std.testing.expectEqualStrings("/run/snats/snats.sock", pool.servers[0].getHost());
+    try std.testing.expect(pool.servers[1].is_uds);
+    try std.testing.expectEqualStrings("/run/a@b/s.sock", pool.servers[1].getHost());
+    try std.testing.expectEqual(@as(u16, 0), pool.servers[1].port);
+
+    // Never reinterpreted as TCP.
+    try std.testing.expectError(error.InvalidUrl, pool.addServer("nats+uds:relative.sock"));
+    try std.testing.expectError(error.InvalidUrl, pool.addServer("nats+uds://localhost:4222/s"));
+    try std.testing.expectEqual(@as(u8, 2), pool.count);
 }
 
 test "server pool nats scheme not uds" {

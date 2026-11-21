@@ -609,14 +609,21 @@ pub fn parseUrl(url: []const u8) error{InvalidUrl}!ParsedUrl {
     if (url.len == 0) return error.InvalidUrl;
     var remaining = url;
     var use_tls = false;
-    var is_uds = false;
 
     if (std.mem.startsWith(u8, remaining, "tls://")) {
         remaining = remaining[6..];
         use_tls = true;
-    } else if (std.mem.startsWith(u8, remaining, "nats+uds://")) {
-        remaining = remaining["nats+uds://".len..];
-        is_uds = true;
+    } else if (std.mem.startsWith(u8, remaining, connection.server_pool.uds_scheme)) {
+        // The socket path is the host; there is no port.
+        const uds = try connection.server_pool.parseUdsUrl(url);
+        return .{
+            .host = uds.path,
+            .port = 0,
+            .user = uds.user,
+            .pass = uds.pass,
+            .use_tls = false,
+            .is_uds = true,
+        };
     } else if (std.mem.startsWith(u8, remaining, "nats://")) {
         remaining = remaining[7..];
     }
@@ -637,19 +644,6 @@ pub fn parseUrl(url: []const u8) error{InvalidUrl}!ParsedUrl {
     }
 
     if (remaining.len == 0) return error.InvalidUrl;
-
-    // For nats+uds the remainder is the socket path verbatim; there is no
-    // host/port to split out.
-    if (is_uds) {
-        return .{
-            .host = remaining,
-            .port = 0,
-            .user = user,
-            .pass = pass,
-            .use_tls = use_tls,
-            .is_uds = true,
-        };
-    }
 
     var host: []const u8 = undefined;
     var port: u16 = 4222;
@@ -5627,8 +5621,28 @@ test "parse url nats+uds scheme" {
         try std.testing.expect(!parsed.is_uds);
     }
 
-    // Missing path is rejected.
+    // Single-slash form; an `@` in the path stays in the path.
+    {
+        const parsed = try parseUrl("nats+uds:/run/a@b/s.sock");
+        try std.testing.expect(parsed.is_uds);
+        try std.testing.expectEqualSlices(u8, "/run/a@b/s.sock", parsed.host);
+        try std.testing.expect(parsed.user == null);
+    }
+    {
+        const parsed = try parseUrl("nats+uds:///run/a@b/s.sock");
+        try std.testing.expect(parsed.is_uds);
+        try std.testing.expectEqualSlices(u8, "/run/a@b/s.sock", parsed.host);
+        try std.testing.expect(parsed.user == null);
+    }
+
+    // Missing or relative path, port, query and fragment are rejected, never
+    // reinterpreted as TCP.
     try std.testing.expectError(error.InvalidUrl, parseUrl("nats+uds://"));
+    try std.testing.expectError(error.InvalidUrl, parseUrl("nats+uds:relative.sock"));
+    try std.testing.expectError(error.InvalidUrl, parseUrl("nats+uds://sock"));
+    try std.testing.expectError(error.InvalidUrl, parseUrl("nats+uds://localhost:4222/s.sock"));
+    try std.testing.expectError(error.InvalidUrl, parseUrl("nats+uds:///s.sock?mode=rw"));
+    try std.testing.expectError(error.InvalidUrl, parseUrl("nats+uds:///s.sock#frag"));
 }
 
 test "options defaults" {
