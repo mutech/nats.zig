@@ -24,7 +24,8 @@ env:
   # Pinned server commit this client was last integrated against. Bumping it is
   # its own commit (integration step of the upstream sync), so a test failure
   # is attributable to either the client change or the server bump.
-  NATS_SERVER_FORK_REF: 168064a8aa18cef4e09e01ec116560b720615615
+  # upstream-sync 2026-11-21-2
+  NATS_SERVER_FORK_REF: 625dbd5feae0737a8e69b64341ab1e38df9e934f
 
 jobs:
   build:
